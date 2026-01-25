@@ -1,0 +1,11 @@
+--- PRODUCTS ---
+P ID 12: |["https://res.cloudinary.com/dpvb8kzao/image/upload/v1768959719/products/lc3lni50sdgk4nv81uyl.png","https://res.cloudinary.com/dpvb8kzao/image/upload/v1768959719/products/egq9pmmwq7lmzf9tacmy.png"]|
+P ID 13: |["https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290346/products/dbm6drdrdpzoxpgd9pv3.png","https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290344/products/ws0brjte7w2vvihasijr.png"]|
+P ID 14: |["https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290980/products/jiu0cakq3uidowqt1kr2.png","https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290982/products/qxdykxzf3f2ael4iw1ms.png"]|
+P ID 15: |["https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290983/products/nuhmpxuifbjuewmswjyo.png","https://res.cloudinary.com/dpvb8kzao/image/upload/v1769290985/products/erkuzxa5mxy1kihsbezp.png"]|
+
+--- CATEGORIES ---
+C ID 7: |uploads/1766006732702-225293688.png|
+C ID 9: |uploads/1766010922158-77804852.png|
+C ID 10: |https://res.cloudinary.com/dpvb8kzao/image/upload/v1768957837/categories/ibzzusb5a4unz9xxhefc.png|
+C ID 11: |https://res.cloudinary.com/dpvb8kzao/image/upload/v1768959116/categories/bg405cld2osfnlo5pobh.png|
