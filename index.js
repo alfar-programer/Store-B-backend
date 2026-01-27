@@ -232,6 +232,7 @@ async function initDatabase() {
         role ENUM('admin', 'customer') DEFAULT 'customer',
         phone VARCHAR(255),
         isVerified BOOLEAN DEFAULT FALSE,
+        isBlocked BOOLEAN DEFAULT FALSE,
         createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
@@ -245,6 +246,17 @@ async function initDatabase() {
       // Column might already exist
       if (!e.message.includes('Duplicate column')) {
         console.log('ℹ️  isVerified column already exists or other error:', e.message);
+      }
+    }
+
+    // Add isBlocked column to existing Users table (if it doesn't exist)
+    try {
+      await connection.query('ALTER TABLE Users ADD COLUMN isBlocked BOOLEAN DEFAULT FALSE AFTER isVerified');
+      console.log('✅ Added isBlocked column to Users table');
+    } catch (e) {
+      // Column might already exist
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  isBlocked column already exists or other error:', e.message);
       }
     }
 
@@ -400,6 +412,16 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
     }
 
     const user = users[0];
+
+    // Check if user is blocked
+    if (user.isBlocked) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account Blocked',
+        errors: [{ path: 'email', msg: 'Your account has been blocked by the administrator.' }]
+      });
+    }
+
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
       return res.status(401).json({
@@ -1041,6 +1063,61 @@ app.delete('/api/categories/:id', adminOnly, validateId, async (req, res) => {
     });
   } catch (error) {
     console.error('Delete category error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error: ' + error.message
+    });
+  }
+});
+
+/* ======================
+   USERS MANAGEMENT
+====================== */
+app.get('/api/users', adminOnly, async (req, res) => {
+  try {
+    const [users] = await pool.query('SELECT id, name, email, role, phone, isVerified, isBlocked, createdAt FROM Users ORDER BY createdAt DESC');
+    res.json({
+      success: true,
+      data: users
+    });
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error: ' + error.message
+    });
+  }
+});
+
+app.put('/api/users/:id/block', adminOnly, validateId, async (req, res) => {
+  try {
+    const { isBlocked } = req.body;
+    const userId = req.params.id;
+
+    if (isBlocked === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'isBlocked status is required'
+      });
+    }
+
+    // Prevent blocking admins? Maybe, but for now let's allow it but warn or prevent self-block if I knew the current user ID here easily without extra query, 
+    // but adminOnly middleware puts user in req.user.
+    if (parseInt(userId) === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: 'You cannot block your own account'
+      });
+    }
+
+    await pool.query('UPDATE Users SET isBlocked = ? WHERE id = ?', [isBlocked, userId]);
+
+    res.json({
+      success: true,
+      message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully`
+    });
+  } catch (error) {
+    console.error('Block user error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error: ' + error.message
