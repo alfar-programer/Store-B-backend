@@ -413,8 +413,8 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
 
     const user = users[0];
 
-    // Check if user is blocked
-    if (user.isBlocked) {
+    // Check if user is blocked (Exclude admins from being blocked to prevent lockout)
+    if (user.isBlocked && user.role !== 'admin') {
       return res.status(403).json({
         success: false,
         message: 'Account Blocked',
