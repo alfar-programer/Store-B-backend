@@ -1,0 +1,122 @@
+
+════════════════════════════════════════════════════════════
+🧪 AUTHENTICATION FLOW TEST SUITE
+════════════════════════════════════════════════════════════
+✅ Connected to database
+
+🧹 Cleaned up test data
+
+📝 TEST 1: Happy Path (Register → Verify → Login)
+────────────────────────────────────────────────────────────
+1️⃣  Registering user...
+
+❌ TEST 1 FAILED: Request failed with status code 500
+   Response: {"success":false,"message":"Failed to send verification email. Please check your email address and try again.","error":"EMAIL_SEND_FAILED"}
+
+📝 TEST 2: Duplicate Registration
+────────────────────────────────────────────────────────────
+1️⃣  Attempting duplicate registration...
+
+❌ TEST 2 FAILED: Request failed with status code 500
+
+📝 TEST 3: Transaction Rollback (Email Failure)
+────────────────────────────────────────────────────────────
+⚠️  This test requires manual verification:
+   1. Temporarily set invalid RESEND_API_KEY in .env
+   2. Try to register a new user
+   3. Verify that NO user is created in the database
+   4. Restore correct RESEND_API_KEY
+
+⏭️  TEST 3 SKIPPED (Manual verification required)
+
+📝 TEST 4: Cleanup Job Configuration
+────────────────────────────────────────────────────────────
+1️⃣  Checking if cleanup cron job is configured...
+✅ Cron job is configured
+✅ User cleanup logic is present
+✅ Verification cleanup logic is present
+
+✅ TEST 4 PASSED
+
+📝 TEST 5: Database Engine Verification
+────────────────────────────────────────────────────────────
+1️⃣  Checking table engines...
+✅ EmailVerifications is using InnoDB
+✅ Users is using InnoDB
+
+✅ TEST 5 PASSED
+🧹 Cleaned up test data
+
+════════════════════════════════════════════════════════════
+📊 TEST SUMMARY
+════════════════════════════════════════════════════════════
+test1: ❌ FAILED
+test2: ❌ FAILED
+test3: ✅ PASSED
+test4: ✅ PASSED
+test5: ✅ PASSED
+
+Total: 3/5 tests passed
+
+⚠️  Some tests failed. Please review the output above.
+
+════════════════════════════════════════════════════════════
+🧪 AUTHENTICATION FLOW TEST SUITE
+════════════════════════════════════════════════════════════
+✅ Connected to database
+
+🧹 Cleaned up test data
+
+📝 TEST 1: Happy Path (Register → Verify → Login)
+────────────────────────────────────────────────────────────
+1️⃣  Registering user...
+
+❌ TEST 1 FAILED: Request failed with status code 500
+   Response: {"success":false,"message":"Failed to send verification email. Please check your email address and try again.","error":"EMAIL_SEND_FAILED"}
+
+📝 TEST 2: Duplicate Registration
+────────────────────────────────────────────────────────────
+1️⃣  Attempting duplicate registration...
+
+❌ TEST 2 FAILED: Request failed with status code 500
+
+📝 TEST 3: Transaction Rollback (Email Failure)
+────────────────────────────────────────────────────────────
+⚠️  This test requires manual verification:
+   1. Temporarily set invalid RESEND_API_KEY in .env
+   2. Try to register a new user
+   3. Verify that NO user is created in the database
+   4. Restore correct RESEND_API_KEY
+
+⏭️  TEST 3 SKIPPED (Manual verification required)
+
+📝 TEST 4: Cleanup Job Configuration
+────────────────────────────────────────────────────────────
+1️⃣  Checking if cleanup cron job is configured...
+✅ Cron job is configured
+✅ User cleanup logic is present
+✅ Verification cleanup logic is present
+
+✅ TEST 4 PASSED
+
+📝 TEST 5: Database Engine Verification
+────────────────────────────────────────────────────────────
+1️⃣  Checking table engines...
+✅ EmailVerifications is using InnoDB
+✅ Users is using InnoDB
+
+✅ TEST 5 PASSED
+🧹 Cleaned up test data
+
+════════════════════════════════════════════════════════════
+📊 TEST SUMMARY
+════════════════════════════════════════════════════════════
+test1: ❌ FAILED
+test2: ❌ FAILED
+test3: ✅ PASSED
+test4: ✅ PASSED
+test5: ✅ PASSED
+
+Total: 3/5 tests passed
+
+⚠️  Some tests failed. Please review the output above.

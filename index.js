@@ -8,7 +8,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const cron = require('node-cron');
-const { sendVerificationEmail, generateOTP } = require('./emailService');
+const { sendVerificationEmail, generateOTP, isConfigured, EMAIL_VERIFICATION_ENABLED } = require('./emailService');
 
 dotenv.config();
 
@@ -33,6 +33,21 @@ if (!process.env.JWT_SECRET) {
     console.warn('⚠️ WARNING: JWT_SECRET not set, using unsafe default for development only.');
     process.env.JWT_SECRET = 'dev-secret-key-do-not-use-in-production';
   }
+}
+
+// Validate Email Service Configuration
+if (EMAIL_VERIFICATION_ENABLED) {
+  if (!isConfigured()) {
+    console.error('❌ WARNING: Email verification is ENABLED but Resend is not properly configured!');
+    console.error('📧 Users will NOT be able to register until you configure Resend.');
+    console.error('📧 Please set RESEND_API_KEY and EMAIL_FROM in your .env file.');
+    console.error('📧 Or set EMAIL_VERIFICATION_ENABLED=false to disable email verification for development.');
+  } else {
+    console.log('✅ Email verification is enabled and configured');
+  }
+} else {
+  console.warn('⚠️  Email verification is DISABLED (EMAIL_VERIFICATION_ENABLED=false)');
+  console.warn('⚠️  Users will be auto-verified without email confirmation - NOT recommended for production!');
 }
 
 
@@ -261,12 +276,16 @@ async function initDatabase() {
     }
 
     // Set existing users as verified (migration for existing users)
+    // Set existing users as verified - DISABLED to prevent auto-verifying new unverified users
+    // This should only be run manually if needed for legacy data migration
+    /*
     try {
       await connection.query('UPDATE Users SET isVerified = TRUE WHERE isVerified IS NULL OR createdAt < NOW()');
       console.log('✅ Marked existing users as verified');
     } catch (e) {
       console.log('ℹ️  Could not update existing users:', e.message);
     }
+    */
 
     // Create EmailVerifications table
     await connection.query(`
@@ -275,6 +294,7 @@ async function initDatabase() {
         email VARCHAR(255) NOT NULL,
         code VARCHAR(255) NOT NULL,
         expiresAt TIMESTAMP NOT NULL,
+        resendCount INT DEFAULT 0,
         createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_email (email),
         INDEX idx_expires (expiresAt)
@@ -365,11 +385,18 @@ app.get('/api/health', (req, res) => {
    AUTH ROUTES
 ====================== */
 app.post('/api/auth/register', authLimiter, validateRegistration, async (req, res) => {
+  const connection = await pool.getConnection();
+
   try {
     const { name, email, password, phone } = req.body;
 
-    const [existing] = await pool.query('SELECT id FROM Users WHERE email = ?', [email]);
+    // Start transaction
+    await connection.beginTransaction();
+
+    // Check if user already exists
+    const [existing] = await connection.query('SELECT id FROM Users WHERE email = ?', [email]);
     if (existing.length > 0) {
+      await connection.rollback();
       return res.status(400).json({
         success: false,
         message: 'User with this email already exists'
@@ -378,22 +405,73 @@ app.post('/api/auth/register', authLimiter, validateRegistration, async (req, re
 
     const hashed = await bcrypt.hash(password, 12); // Increased salt rounds for security
 
-    // Insert user with isVerified = TRUE (no email verification required)
-    await pool.query(
-      'INSERT INTO Users (name, email, password, phone, isVerified) VALUES (?, ?, ?, ?, TRUE)',
+    // Insert user with isVerified = FALSE
+    const [insertResult] = await connection.query(
+      'INSERT INTO Users (name, email, password, phone, isVerified) VALUES (?, ?, ?, ?, FALSE)',
       [name, email, hashed, phone]
     );
 
+    const userId = insertResult.insertId;
+
+    // Generate and send OTP
+    const otp = generateOTP();
+    const hashedOTP = await bcrypt.hash(otp, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Clean up any old verifications for this email
+    await connection.query('DELETE FROM EmailVerifications WHERE email = ?', [email]);
+
+    // Store verification code
+    await connection.query(
+      'INSERT INTO EmailVerifications (email, code, expiresAt) VALUES (?, ?, ?)',
+      [email, hashedOTP, expiresAt]
+    );
+
+    // Send verification email - THIS MUST SUCCEED
+    try {
+      const emailResult = await sendVerificationEmail(email, otp, name);
+
+      if (!emailResult.success) {
+        throw new Error('Email sending failed');
+      }
+
+      console.log(`✅ Verification email sent to ${email} (Message ID: ${emailResult.messageId})`);
+    } catch (emailError) {
+      console.error('❌ Failed to send verification email during registration:', emailError);
+
+      // ROLLBACK the transaction - delete the user and verification code
+      await connection.rollback();
+      connection.release();
+
+      // Return a clear error to the user
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send verification email. Please check your email address and try again.',
+        error: 'EMAIL_SEND_FAILED',
+        details: process.env.NODE_ENV === 'development' ? emailError.message : undefined
+      });
+    }
+
+    // Commit transaction - everything succeeded
+    await connection.commit();
+    connection.release();
+
     res.json({
       success: true,
-      message: 'Registration successful! You can now log in.',
-      email: email
+      message: 'Registration successful! Please check your email to verify your account.',
+      email: email,
+      requiresVerification: true
     });
   } catch (error) {
+    // Rollback on any error
+    await connection.rollback();
+    connection.release();
+
     console.error('Register error:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error'
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -412,6 +490,16 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
     }
 
     const user = users[0];
+
+    // Check if user is verified
+    if (!user.isVerified) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email not verified. Please check your email for the verification code.',
+        requiresVerification: true,
+        email: user.email
+      });
+    }
 
     // Check if user is blocked (Exclude admins from being blocked to prevent lockout)
     if (user.isBlocked && user.role !== 'admin') {
@@ -602,24 +690,66 @@ app.post('/api/auth/resend-verification', resendLimiter, async (req, res) => {
     // Set expiration time (10 minutes from now)
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    // Delete any existing verification codes for this email
-    await pool.query('DELETE FROM EmailVerifications WHERE email = ?', [email]);
-
-    // Store new verification code
-    await pool.query(
-      'INSERT INTO EmailVerifications (email, code, expiresAt) VALUES (?, ?, ?)',
-      [email, hashedOTP, expiresAt]
+    // Check existing verification to enforce limit
+    const [existingVerifications] = await pool.query(
+      'SELECT * FROM EmailVerifications WHERE email = ?',
+      [email]
     );
+
+    let resendCount = 0;
+
+    if (existingVerifications.length > 0) {
+      const existing = existingVerifications[0];
+      resendCount = existing.resendCount || 0;
+
+      if (resendCount >= 3) {
+        return res.status(429).json({
+          success: false,
+          message: 'Maximum resend limit reached (3). Please wait for the code to expire or register again.'
+        });
+      }
+
+      // Increment count
+      resendCount++;
+
+      // Update existing record
+      await pool.query(
+        'UPDATE EmailVerifications SET code = ?, expiresAt = ?, resendCount = ? WHERE email = ?',
+        [hashedOTP, expiresAt, resendCount, email]
+      );
+    } else {
+      // New record (shouldn't happen much if user exists unverified, but safe fallback)
+      await pool.query(
+        'INSERT INTO EmailVerifications (email, code, expiresAt, resendCount) VALUES (?, ?, ?, 0)',
+        [email, hashedOTP, expiresAt]
+      );
+    }
 
     // Send verification email
     try {
-      await sendVerificationEmail(email, otp, user.name);
-      console.log(`✅ Verification email resent to ${email}`);
+      const emailResult = await sendVerificationEmail(email, otp, user.name);
+
+      if (!emailResult.success) {
+        throw new Error('Email sending failed');
+      }
+
+      console.log(`✅ Verification email resent to ${email} (Message ID: ${emailResult.messageId})`);
     } catch (emailError) {
       console.error('❌ Failed to resend verification email:', emailError);
+
+      // Revert the update/insert if email fails
+      if (resendCount > 0) {
+        // Decrement back if we just incremented
+        await pool.query('UPDATE EmailVerifications SET resendCount = resendCount - 1 WHERE email = ?', [email]);
+      } else {
+        await pool.query('DELETE FROM EmailVerifications WHERE email = ?', [email]);
+      }
+
       return res.status(500).json({
         success: false,
-        message: 'Failed to send verification email. Please try again later.'
+        message: 'Failed to send verification email. Please try again later.',
+        error: 'EMAIL_SEND_FAILED',
+        details: process.env.NODE_ENV === 'development' ? emailError.message : undefined
       });
     }
 
@@ -631,7 +761,8 @@ app.post('/api/auth/resend-verification', resendLimiter, async (req, res) => {
     console.error('Resend verification error:', error);
     res.status(500).json({
       success: false,
-      message: 'Server error'
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -1128,12 +1259,23 @@ app.put('/api/users/:id/block', adminOnly, validateId, async (req, res) => {
 /* ======================
    START SERVER
 ====================== */
-// Cleanup job for expired verification codes - runs every hour
+// Cleanup job for expired verification codes and unverified users - runs every hour
 cron.schedule('0 * * * *', async () => {
   try {
-    const [result] = await pool.query('DELETE FROM EmailVerifications WHERE expiresAt < NOW()');
-    if (result.affectedRows > 0) {
-      console.log(`🧹 Cleaned up ${result.affectedRows} expired verification codes`);
+    // Clean up expired verification codes
+    const [verificationResult] = await pool.query('DELETE FROM EmailVerifications WHERE expiresAt < NOW()');
+    if (verificationResult.affectedRows > 0) {
+      console.log(`🧹 Cleaned up ${verificationResult.affectedRows} expired verification codes`);
+    }
+
+    // Clean up unverified users older than 24 hours
+    const [userResult] = await pool.query(`
+      DELETE FROM Users 
+      WHERE isVerified = FALSE 
+      AND createdAt < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+    `);
+    if (userResult.affectedRows > 0) {
+      console.log(`🧹 Cleaned up ${userResult.affectedRows} unverified users older than 24 hours`);
     }
   } catch (error) {
     console.error('❌ Cleanup job error:', error);
