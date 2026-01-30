@@ -55,6 +55,54 @@ if (EMAIL_VERIFICATION_ENABLED) {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// CORS Configuration - MUST BE AT THE TOP
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'https://www.warmtotuch.store',
+  'https://warmtotuch.store',
+  'https://store-b-frontend.vercel.app',
+  'https://store-b-admin.vercel.app',
+  'https://store-b-production.up.railway.app',
+  'https://store-b-dashboard-production.up.railway.app',
+  'https://store-b-backend-production.up.railway.app',
+  process.env.FRONTEND_URL,
+  process.env.ADMIN_URL
+].filter(Boolean);
+
+app.use(cookieParser());
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Log origin for debugging
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('Incoming Origin:', origin);
+    }
+
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+
+    // Allow any localhost origin for development
+    if (origin && origin.startsWith('http://localhost:')) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('❌ CORS Blocked Origin:', origin);
+      // Instead of failing the handshake with an error, we just don't set the origin header
+      // This is safer and allows the browser to handle the specific CORS error
+      callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control'],
+  exposedHeaders: ['set-cookie']
+}));
+
 /* ======================
    SECURITY MIDDLEWARE
 ====================== */
@@ -128,45 +176,6 @@ if (process.env.NODE_ENV === 'production') {
 /* ======================
    MIDDLEWARE
 ====================== */
-// CORS Configuration - Restrict to specific origins
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5173',
-  'http://localhost:5174',
-  'https://www.warmtotuch.store',
-  'https://warmtotuch.store',
-  'https://store-b-frontend.vercel.app',
-  'https://store-b-admin.vercel.app',
-  'https://store-b-production.up.railway.app',
-  'https://store-b-dashboard-production.up.railway.app',
-  'https://store-b-backend-production.up.railway.app',
-  process.env.FRONTEND_URL,
-  process.env.ADMIN_URL
-].filter(Boolean);
-
-app.use(cookieParser());
-
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
-    if (!origin) return callback(null, true);
-
-    // Allow any localhost origin for development
-    if (origin && origin.startsWith('http://localhost:')) {
-      return callback(null, true);
-    }
-
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log('❌ CORS Blocked Origin:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
-}));
 
 app.use(express.json({ limit: '10mb' })); // Limit payload size
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
