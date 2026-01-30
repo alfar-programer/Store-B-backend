@@ -50,7 +50,7 @@ async function createAdminUser() {
 
         const hashedPassword = await bcrypt.hash(adminPassword, 10);
         await connection.query(
-            'INSERT INTO Users (name, email, password, role, phone) VALUES (?, ?, ?, ?, ?)',
+            'INSERT INTO Users (name, email, password, role, phone, isVerified) VALUES (?, ?, ?, ?, ?, TRUE)',
             ['Admin User', adminEmail, hashedPassword, 'admin', '1234567890']
         );
 
