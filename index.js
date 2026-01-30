@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const path = require('path');
 const mysql = require('mysql2/promise');
@@ -132,13 +133,18 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
   'http://localhost:5174',
+  'https://www.warmtotuch.store',
+  'https://warmtotuch.store',
   'https://store-b-frontend.vercel.app',
   'https://store-b-admin.vercel.app',
   'https://store-b-production.up.railway.app',
   'https://store-b-dashboard-production.up.railway.app',
+  'https://store-b-backend-production.up.railway.app',
   process.env.FRONTEND_URL,
   process.env.ADMIN_URL
 ].filter(Boolean);
+
+app.use(cookieParser());
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -159,7 +165,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
 }));
 
 app.use(express.json({ limit: '10mb' })); // Limit payload size
@@ -525,9 +531,18 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
       { expiresIn: '24h' }
     );
 
+    // Set cookie for production
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production', // true in production
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // 'none' for cross-domain in production
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+      domain: process.env.NODE_ENV === 'production' ? '.up.railway.app' : undefined // Allow subdomains if needed, or specific domain
+    });
+
     res.json({
       success: true,
-      token,
+      token, // Keep sending token for legacy frontend support if needed
       role: user.role,
       user: {
         id: user.id,
@@ -543,6 +558,16 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
       message: 'Server error: ' + error.message
     });
   }
+});
+
+// Logout endpoint
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  });
+  res.json({ success: true, message: 'Logged out successfully' });
 });
 
 // Verification rate limiter - 5 attempts per 15 minutes
