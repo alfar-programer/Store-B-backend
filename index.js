@@ -62,6 +62,8 @@ const allowedOrigins = [
   'http://localhost:5174',
   'https://www.warmtotuch.store',
   'https://warmtotuch.store',
+  'https://www.warmtouch.store',
+  'https://warmtouch.store',
   'https://store-b-frontend.vercel.app',
   'https://store-b-admin.vercel.app',
   'https://store-b-production.up.railway.app',
@@ -554,7 +556,7 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
       secure: true, // Always true for https
       sameSite: 'none', // Required for cross-site cookies
       maxAge: 24 * 60 * 60 * 1000, // 24 hours
-      // domain: '.up.railway.app' // Removed to allow browser to handle cross-site association
+      path: '/',
     });
 
     res.json({
