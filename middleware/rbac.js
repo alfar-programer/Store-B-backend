@@ -9,21 +9,27 @@ const jwt = require('jsonwebtoken');
  * Verify JWT token and attach user to request
  */
 const authenticateToken = (req, res, next) => {
+    // Log request details for debugging
+    console.log(`--- Auth Debug [${req.method}] ${req.path} ---`);
+    console.log('Origin:', req.headers.origin);
+    console.log('Authorization Header:', req.headers.authorization ? 'Present' : 'MISSING');
+    console.log('Cookies Present:', req.cookies ? Object.keys(req.cookies) : 'NONE');
+
     const authHeader = req.headers.authorization;
     let token = authHeader && authHeader.split(' ')[1];
 
-    // Handle "undefined" or "null" strings being passed as tokens
     if (token === 'undefined' || token === 'null') {
+        console.warn('⚠️ Token is string "undefined" or "null"');
         token = null;
     }
 
-    // If no token in headers, check cookies
     if (!token && req.cookies) {
         token = req.cookies.token;
+        if (token) console.log('✅ Found token in cookie');
     }
 
     if (!token) {
-        console.warn('🔓 Auth Failed: No token provided in headers or cookies for path:', req.path);
+        console.warn('❌ Auth Failed: No token found in headers or cookies');
         return res.status(401).json({
             success: false,
             message: 'Access denied. No token provided.'
@@ -33,9 +39,10 @@ const authenticateToken = (req, res, next) => {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.user = decoded;
+        console.log('✅ Auth Success: User ID', decoded.id);
         next();
     } catch (error) {
-        console.error('🔐 Auth Failed: Invalid or expired token for path:', req.path, 'Error:', error.message);
+        console.error('❌ Auth Failed: Invalid/Expired Token -', error.message);
         return res.status(403).json({
             success: false,
             message: 'Invalid or expired token.'
