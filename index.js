@@ -451,6 +451,17 @@ app.post('/api/auth/register', authLimiter, validateRegistration, async (req, re
       }
 
       console.log(`✅ Verification email sent to ${email} (Message ID: ${emailResult.messageId})`);
+
+      // Commit transaction - everything succeeded
+      await connection.commit();
+      connection.release();
+
+      res.json({
+        success: true,
+        message: 'Registration successful! Please check your email to verify your account.',
+        email: email,
+        requiresVerification: true
+      });
     } catch (emailError) {
       console.error('❌ Failed to send verification email during registration:', emailError);
 
@@ -463,30 +474,27 @@ app.post('/api/auth/register', authLimiter, validateRegistration, async (req, re
         success: false,
         message: 'Failed to send verification email. Please check your email address and try again.',
         error: 'EMAIL_SEND_FAILED',
-        details: process.env.NODE_ENV === 'development' ? emailError.message : undefined
+        details: emailError.message // Expose message to help debug
       });
     }
-
-    // Commit transaction - everything succeeded
-    await connection.commit();
-    connection.release();
-
-    res.json({
-      success: true,
-      message: 'Registration successful! Please check your email to verify your account.',
-      email: email,
-      requiresVerification: true
-    });
   } catch (error) {
     // Rollback on any error
-    await connection.rollback();
-    connection.release();
+    if (connection) {
+      try {
+        if (connection.state !== 'disconnected') {
+          await connection.rollback();
+          connection.release();
+        }
+      } catch (rollbackErr) {
+        // Already released or error rolling back
+      }
+    }
 
     console.error('Register error:', error);
     res.status(500).json({
       success: false,
       message: 'Server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      details: error.message
     });
   }
 });
@@ -543,10 +551,10 @@ app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
     // Set cookie for production
     res.cookie('token', token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production', // true in production
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // 'none' for cross-domain in production
+      secure: true, // Always true for https
+      sameSite: 'none', // Required for cross-site cookies
       maxAge: 24 * 60 * 60 * 1000, // 24 hours
-      domain: process.env.NODE_ENV === 'production' ? '.up.railway.app' : undefined // Allow subdomains if needed, or specific domain
+      // domain: '.up.railway.app' // Removed to allow browser to handle cross-site association
     });
 
     res.json({

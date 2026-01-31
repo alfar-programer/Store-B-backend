@@ -12,6 +12,11 @@ const authenticateToken = (req, res, next) => {
     const authHeader = req.headers.authorization;
     let token = authHeader && authHeader.split(' ')[1];
 
+    // Handle "undefined" or "null" strings being passed as tokens
+    if (token === 'undefined' || token === 'null') {
+        token = null;
+    }
+
     // If no token in headers, check cookies
     if (!token && req.cookies) {
         token = req.cookies.token;
