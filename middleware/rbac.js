@@ -23,6 +23,7 @@ const authenticateToken = (req, res, next) => {
     }
 
     if (!token) {
+        console.warn('🔓 Auth Failed: No token provided in headers or cookies for path:', req.path);
         return res.status(401).json({
             success: false,
             message: 'Access denied. No token provided.'
@@ -34,6 +35,7 @@ const authenticateToken = (req, res, next) => {
         req.user = decoded;
         next();
     } catch (error) {
+        console.error('🔐 Auth Failed: Invalid or expired token for path:', req.path, 'Error:', error.message);
         return res.status(403).json({
             success: false,
             message: 'Invalid or expired token.'
