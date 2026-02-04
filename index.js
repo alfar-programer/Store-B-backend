@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const cron = require('node-cron');
 const { sendVerificationEmail, generateOTP, isConfigured, EMAIL_VERIFICATION_ENABLED } = require('./emailService');
+const { verifyGoogleToken, validateGoogleConfig } = require('./googleOAuth');
 
 dotenv.config();
 
@@ -49,6 +50,15 @@ if (EMAIL_VERIFICATION_ENABLED) {
 } else {
   console.warn('⚠️  Email verification is DISABLED (EMAIL_VERIFICATION_ENABLED=false)');
   console.warn('⚠️  Users will be auto-verified without email confirmation - NOT recommended for production!');
+}
+
+// Validate Google OAuth Configuration
+if (process.env.GOOGLE_CLIENT_ID) {
+  validateGoogleConfig();
+  console.log('✅ Google OAuth is enabled');
+} else {
+  console.warn('⚠️  Google OAuth is DISABLED (GOOGLE_CLIENT_ID not set)');
+  console.warn('⚠️  Users will not be able to sign in with Google');
 }
 
 
@@ -290,6 +300,33 @@ async function initDatabase() {
       if (!e.message.includes('Duplicate column')) {
         console.log('ℹ️  isBlocked column already exists or other error:', e.message);
       }
+    }
+
+    // Add Google OAuth columns to existing Users table
+    try {
+      await connection.query('ALTER TABLE Users ADD COLUMN googleId VARCHAR(255) UNIQUE AFTER email');
+      console.log('✅ Added googleId column to Users table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  googleId column already exists or other error:', e.message);
+      }
+    }
+
+    try {
+      await connection.query('ALTER TABLE Users ADD COLUMN avatar TEXT AFTER googleId');
+      console.log('✅ Added avatar column to Users table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  avatar column already exists or other error:', e.message);
+      }
+    }
+
+    // Make password nullable for OAuth users (who don't have passwords)
+    try {
+      await connection.query('ALTER TABLE Users MODIFY password VARCHAR(255) NULL');
+      console.log('✅ Made password column nullable for OAuth users');
+    } catch (e) {
+      console.log('ℹ️  Password column modification:', e.message);
     }
 
     // Set existing users as verified (migration for existing users)
@@ -812,6 +849,237 @@ app.post('/api/auth/resend-verification', resendLimiter, async (req, res) => {
 });
 
 /* ======================
+   GOOGLE OAUTH ROUTES
+====================== */
+
+/**
+ * POST /api/auth/google/login
+ * Stateless Google OAuth authentication
+ * 
+ * Flow:
+ * 1. Frontend shows Google popup
+ * 2. User authenticates with Google
+ * 3. Frontend receives credential token
+ * 4. Frontend sends token to this endpoint
+ * 5. Backend verifies token with Google
+ * 6. Create/find user in database
+ * 7. Generate JWT
+ * 8. Set httpOnly cookie
+ * 9. Return user data
+ */
+app.post('/api/auth/google/login', authLimiter, async (req, res) => {
+  const connection = await pool.getConnection();
+
+  try {
+    const { credential } = req.body;
+
+    // Validate credential token exists
+    if (!credential) {
+      return res.status(400).json({
+        success: false,
+        message: 'Google credential token is required'
+      });
+    }
+
+    // Verify the Google ID token with Google's servers
+    let googleUser;
+    try {
+      googleUser = await verifyGoogleToken(credential);
+    } catch (verifyError) {
+      console.error('❌ Google token verification failed:', verifyError.message);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid Google token',
+        error: 'GOOGLE_VERIFICATION_FAILED'
+      });
+    }
+
+    const { googleId, email, name, avatar, emailVerified } = googleUser;
+
+    // Only allow verified Google emails
+    if (!emailVerified) {
+      return res.status(403).json({
+        success: false,
+        message: 'Please use a verified Google account'
+      });
+    }
+
+    await connection.beginTransaction();
+
+    // Check if user exists by Google ID first
+    let [users] = await connection.query(
+      'SELECT * FROM Users WHERE googleId = ?',
+      [googleId]
+    );
+
+    let user;
+
+    if (users.length > 0) {
+      // User exists with this Google ID - login
+      user = users[0];
+      console.log(`✅ Existing Google user logged in: ${email}`);
+    } else {
+      // Check if user exists with this email (password account)
+      [users] = await connection.query(
+        'SELECT * FROM Users WHERE email = ?',
+        [email]
+      );
+
+      if (users.length > 0) {
+        // Link Google account to existing email/password account
+        user = users[0];
+        await connection.query(
+          'UPDATE Users SET googleId = ?, avatar = ?, isVerified = TRUE WHERE id = ?',
+          [googleId, avatar, user.id]
+        );
+        console.log(`✅ Linked Google account to existing user: ${email}`);
+      } else {
+        // Create new user with Google account
+        const [insertResult] = await connection.query(
+          'INSERT INTO Users (name, email, googleId, avatar, isVerified, role) VALUES (?, ?, ?, ?, TRUE, ?)',
+          [name, email, googleId, avatar, 'customer']
+        );
+
+        const userId = insertResult.insertId;
+        [users] = await connection.query('SELECT * FROM Users WHERE id = ?', [userId]);
+        user = users[0];
+        console.log(`✅ Created new Google user: ${email}`);
+      }
+    }
+
+    // Check if user account is blocked
+    if (user.isBlocked && user.role !== 'admin') {
+      await connection.rollback();
+      connection.release();
+      return res.status(403).json({
+        success: false,
+        message: 'Your account has been blocked. Please contact support.'
+      });
+    }
+
+    // Commit transaction
+    await connection.commit();
+    connection.release();
+
+    // Generate JWT token
+    const token = jwt.sign(
+      {
+        id: user.id,
+        role: user.role,
+        email: user.email,
+        authMethod: 'google'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' } // 7 days for OAuth users
+    );
+
+    // Set httpOnly cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+    });
+
+    // Return user data (no password field for OAuth users)
+    res.json({
+      success: true,
+      message: 'Successfully authenticated with Google',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+        authMethod: 'google'
+      }
+    });
+
+  } catch (error) {
+    // Rollback on any error
+    if (connection) {
+      try {
+        if (connection.state !== 'disconnected') {
+          await connection.rollback();
+          connection.release();
+        }
+      } catch (rollbackErr) {
+        console.error('Rollback error:', rollbackErr);
+      }
+    }
+
+    console.error('Google OAuth login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during Google authentication',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /api/auth/profile
+ * Get current authenticated user profile
+ * Protected route - requires valid JWT in cookie
+ */
+app.get('/api/auth/profile', authenticateToken, async (req, res) => {
+  try {
+    // req.user is set by authenticateToken middleware
+    const [users] = await pool.query(
+      'SELECT id, name, email, avatar, role, googleId, createdAt FROM Users WHERE id = ?',
+      [req.user.id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    const user = users[0];
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+        authMethod: user.googleId ? 'google' : 'email',
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
+/**
+ * POST /api/auth/google/logout
+ * Logout user by clearing the JWT cookie
+ */
+app.post('/api/auth/google/logout', (req, res) => {
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    path: '/'
+  });
+
+  res.json({
+    success: true,
+    message: 'Logged out successfully'
+  });
+});
+
+/* ======================
    PRODUCTS
 ====================== */
 app.get('/api/products', async (req, res) => {
@@ -1305,6 +1573,10 @@ app.put('/api/users/:id/block', adminOnly, validateId, async (req, res) => {
 ====================== */
 // Cleanup job for expired verification codes and unverified users - runs every hour
 cron.schedule('0 * * * *', async () => {
+  if (!pool) {
+    console.log('⚠️ Database pool not initialized, skipping cleanup job');
+    return;
+  }
   try {
     // Clean up expired verification codes
     const [verificationResult] = await pool.query('DELETE FROM EmailVerifications WHERE expiresAt < NOW()');
