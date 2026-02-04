@@ -982,10 +982,11 @@ app.post('/api/auth/google/login', authLimiter, async (req, res) => {
       path: '/',
     });
 
-    // Return user data (no password field for OAuth users)
+    // Return user data AND token (for localStorage storage on frontend)
     res.json({
       success: true,
       message: 'Successfully authenticated with Google',
+      token: token, // CRITICAL: Send token in response for frontend localStorage
       user: {
         id: user.id,
         name: user.name,
