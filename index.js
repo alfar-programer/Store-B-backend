@@ -119,7 +119,6 @@ app.use(cors({
    SECURITY MIDDLEWARE
 ====================== */
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const hpp = require('hpp');
 
@@ -133,6 +132,18 @@ const {
   validateOrder,
   validateId
 } = require('./middleware/validators');
+
+// Import new security middleware
+const {
+  loginLimiter,
+  signupLimiter,
+  globalLimiter,
+  checkBlacklist,
+  checkWhitelist,
+  verifyCaptcha,
+  progressiveDelay,
+  logSecurityEvent
+} = require('./middleware/security');
 
 // Helmet - Security headers
 app.use(helmet({
@@ -149,41 +160,31 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
-// Rate limiting - Prevent brute force attacks
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: {
-    success: false,
-    message: 'Too many requests from this IP, please try again later.'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// Stricter rate limit for auth endpoints
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // Limit each IP to 30 login attempts per windowMs
-  message: {
-    success: false,
-    message: 'Too many login attempts, please try again later.'
-  },
-  skipSuccessfulRequests: true,
-});
-
-// Apply rate limiting to all routes
-app.use('/api/', limiter);
-
-// HTTP Parameter Pollution protection
-app.use(hpp());
-
 // Request logging
 if (process.env.NODE_ENV === 'production') {
   app.use(morgan('combined')); // Detailed logging in production
 } else {
   app.use(morgan('dev')); // Concise logging in development
 }
+
+/* ======================
+   GLOBAL SECURITY PROTECTION
+====================== */
+// Check IP blacklist before processing any request (lazy evaluation)
+app.use((req, res, next) => {
+  if (pool) {
+    return checkBlacklist(pool)(req, res, next);
+  }
+  next();
+});
+
+// Apply global rate limiting to all API endpoints (lazy evaluation)
+app.use('/api/', (req, res, next) => {
+  if (pool) {
+    return globalLimiter(pool)(req, res, next);
+  }
+  next();
+});
 
 /* ======================
    MIDDLEWARE
@@ -378,6 +379,53 @@ async function initDatabase() {
       // Column might already exist
     }
 
+    // Create security_events table
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS security_events (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        ip VARCHAR(45) NOT NULL,
+        event_type ENUM(
+          'login_failed', 
+          'login_success', 
+          'signup_attempt', 
+          'rate_limit_exceeded', 
+          'captcha_failed',
+          'ip_blocked',
+          'blocked_ip_attempt'
+        ) NOT NULL,
+        endpoint VARCHAR(255),
+        user_id INT NULL,
+        email VARCHAR(255),
+        user_agent TEXT,
+        success BOOLEAN DEFAULT FALSE,
+        metadata JSON,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ip_timestamp (ip, timestamp),
+        INDEX idx_user_timestamp (user_id, timestamp),
+        INDEX idx_event_type (event_type),
+        INDEX idx_timestamp (timestamp),
+        FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // Create blocked_ips table
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS blocked_ips (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        ip VARCHAR(45) UNIQUE NOT NULL,
+        reason VARCHAR(255),
+        blocked_until TIMESTAMP NOT NULL,
+        auto_unblock BOOLEAN DEFAULT TRUE,
+        block_count INT DEFAULT 1,
+        blocked_by VARCHAR(255) DEFAULT 'system',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_ip (ip),
+        INDEX idx_blocked_until (blocked_until),
+        INDEX idx_auto_unblock (auto_unblock)
+      )
+    `);
+
     console.log('✅ Database tables initialized');
   } finally {
     connection.release();
@@ -438,183 +486,269 @@ app.get('/api/health', (req, res) => {
 /* ======================
    AUTH ROUTES
 ====================== */
-app.post('/api/auth/register', authLimiter, validateRegistration, async (req, res) => {
-  const connection = await pool.getConnection();
+app.post('/api/auth/register',
+  checkWhitelist,
+  signupLimiter(pool),
+  progressiveDelay('signup'),
+  validateRegistration,
+  async (req, res) => {
+    const connection = await pool.getConnection();
 
-  try {
-    const { name, email, password, phone } = req.body;
-
-    // Start transaction
-    await connection.beginTransaction();
-
-    // Check if user already exists
-    const [existing] = await connection.query('SELECT id FROM Users WHERE email = ?', [email]);
-    if (existing.length > 0) {
-      await connection.rollback();
-      return res.status(400).json({
-        success: false,
-        message: 'User with this email already exists'
-      });
-    }
-
-    const hashed = await bcrypt.hash(password, 12); // Increased salt rounds for security
-
-    // Insert user with isVerified = FALSE
-    const [insertResult] = await connection.query(
-      'INSERT INTO Users (name, email, password, phone, isVerified) VALUES (?, ?, ?, ?, FALSE)',
-      [name, email, hashed, phone]
-    );
-
-    const userId = insertResult.insertId;
-
-    // Generate and send OTP
-    const otp = generateOTP();
-    const hashedOTP = await bcrypt.hash(otp, 10);
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-    // Clean up any old verifications for this email
-    await connection.query('DELETE FROM EmailVerifications WHERE email = ?', [email]);
-
-    // Store verification code
-    await connection.query(
-      'INSERT INTO EmailVerifications (email, code, expiresAt) VALUES (?, ?, ?)',
-      [email, hashedOTP, expiresAt]
-    );
-
-    // Send verification email - THIS MUST SUCCEED
     try {
-      const emailResult = await sendVerificationEmail(email, otp, name);
+      const { name, email, password, phone } = req.body;
 
-      if (!emailResult.success) {
-        throw new Error('Email sending failed');
+      // Log signup attempt
+      await logSecurityEvent(pool, {
+        ip: req.ip,
+        event_type: 'signup_attempt',
+        endpoint: req.path,
+        email,
+        user_agent: req.get('user-agent'),
+        success: false
+      });
+
+      // Start transaction
+      await connection.beginTransaction();
+
+      // Check if user already exists
+      const [existing] = await connection.query('SELECT id FROM Users WHERE email = ?', [email]);
+      if (existing.length > 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: 'User with this email already exists'
+        });
       }
 
-      console.log(`✅ Verification email sent to ${email} (Message ID: ${emailResult.messageId})`);
+      const hashed = await bcrypt.hash(password, 12); // Increased salt rounds for security
 
-      // Commit transaction - everything succeeded
-      await connection.commit();
-      connection.release();
+      // Insert user with isVerified = FALSE
+      const [insertResult] = await connection.query(
+        'INSERT INTO Users (name, email, password, phone, isVerified) VALUES (?, ?, ?, ?, FALSE)',
+        [name, email, hashed, phone]
+      );
+
+      const userId = insertResult.insertId;
+
+      // Generate and send OTP
+      const otp = generateOTP();
+      const hashedOTP = await bcrypt.hash(otp, 10);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      // Clean up any old verifications for this email
+      await connection.query('DELETE FROM EmailVerifications WHERE email = ?', [email]);
+
+      // Store verification code
+      await connection.query(
+        'INSERT INTO EmailVerifications (email, code, expiresAt) VALUES (?, ?, ?)',
+        [email, hashedOTP, expiresAt]
+      );
+
+      // Send verification email - THIS MUST SUCCEED
+      try {
+        const emailResult = await sendVerificationEmail(email, otp, name);
+
+        if (!emailResult.success) {
+          throw new Error('Email sending failed');
+        }
+
+        console.log(`✅ Verification email sent to ${email} (Message ID: ${emailResult.messageId})`);
+
+        // Log successful signup
+        await logSecurityEvent(pool, {
+          ip: req.ip,
+          event_type: 'signup_attempt',
+          endpoint: req.path,
+          user_id: userId,
+          email,
+          user_agent: req.get('user-agent'),
+          success: true
+        });
+
+        // Commit transaction - everything succeeded
+        await connection.commit();
+        connection.release();
+
+        res.json({
+          success: true,
+          message: 'Registration successful! Please check your email to verify your account.',
+          email: email,
+          requiresVerification: true
+        });
+      } catch (emailError) {
+        console.error('❌ Failed to send verification email during registration:', emailError);
+
+        // ROLLBACK the transaction - delete the user and verification code
+        await connection.rollback();
+        connection.release();
+
+        // Return a clear error to the user
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to send verification email. Please check your email address and try again.',
+          error: 'EMAIL_SEND_FAILED',
+          details: emailError.message // Expose message to help debug
+        });
+      }
+    } catch (error) {
+      // Rollback on any error
+      if (connection) {
+        try {
+          if (connection.state !== 'disconnected') {
+            await connection.rollback();
+            connection.release();
+          }
+        } catch (rollbackErr) {
+          // Already released or error rolling back
+        }
+      }
+
+      console.error('Register error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Server error',
+        details: error.message
+      });
+    }
+  });
+
+app.post('/api/auth/login',
+  checkWhitelist,
+  progressiveDelay('login'),
+  loginLimiter(pool),
+  validateLogin,
+  async (req, res) => {
+    try {
+      const { email, password } = req.body;
+
+      const [users] = await pool.query('SELECT * FROM Users WHERE email = ?', [email]);
+      if (users.length === 0) {
+        // Log failed login attempt
+        await logSecurityEvent(pool, {
+          ip: req.ip,
+          event_type: 'login_failed',
+          endpoint: req.path,
+          email,
+          user_agent: req.get('user-agent'),
+          success: false,
+          metadata: { reason: 'user_not_found' }
+        });
+
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid credentials',
+          errors: [{ path: 'email', msg: 'No account found with this email address' }]
+        });
+      }
+
+      const user = users[0];
+
+      // Check if user is verified
+      if (!user.isVerified) {
+        await logSecurityEvent(pool, {
+          ip: req.ip,
+          event_type: 'login_failed',
+          endpoint: req.path,
+          user_id: user.id,
+          email,
+          user_agent: req.get('user-agent'),
+          success: false,
+          metadata: { reason: 'not_verified' }
+        });
+
+        return res.status(401).json({
+          success: false,
+          message: 'Email not verified. Please check your email for the verification code.',
+          requiresVerification: true,
+          email: user.email
+        });
+      }
+
+      // Check if user is blocked (Exclude admins from being blocked to prevent lockout)
+      if (user.isBlocked && user.role !== 'admin') {
+        await logSecurityEvent(pool, {
+          ip: req.ip,
+          event_type: 'login_failed',
+          endpoint: req.path,
+          user_id: user.id,
+          email,
+          user_agent: req.get('user-agent'),
+          success: false,
+          metadata: { reason: 'account_blocked' }
+        });
+
+        return res.status(403).json({
+          success: false,
+          message: 'Account Blocked',
+          errors: [{ path: 'email', msg: 'Your account has been blocked by the administrator.' }]
+        });
+      }
+
+      const match = await bcrypt.compare(password, user.password);
+      if (!match) {
+        await logSecurityEvent(pool, {
+          ip: req.ip,
+          event_type: 'login_failed',
+          endpoint: req.path,
+          user_id: user.id,
+          email,
+          user_agent: req.get('user-agent'),
+          success: false,
+          metadata: { reason: 'wrong_password' }
+        });
+
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid credentials',
+          errors: [{ path: 'password', msg: 'Incorrect password' }]
+        });
+      }
+
+      const token = jwt.sign(
+        { id: user.id, role: user.role, email: user.email },
+        process.env.JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      // Set cookie for production
+      res.cookie('token', token, {
+        httpOnly: true,
+        secure: true, // Always true for https
+        sameSite: 'none', // Required for cross-site cookies
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        path: '/',
+      });
+
+      // Log successful login
+      await logSecurityEvent(pool, {
+        ip: req.ip,
+        event_type: 'login_success',
+        endpoint: req.path,
+        user_id: user.id,
+        email,
+        user_agent: req.get('user-agent'),
+        success: true
+      });
 
       res.json({
         success: true,
-        message: 'Registration successful! Please check your email to verify your account.',
-        email: email,
-        requiresVerification: true
-      });
-    } catch (emailError) {
-      console.error('❌ Failed to send verification email during registration:', emailError);
-
-      // ROLLBACK the transaction - delete the user and verification code
-      await connection.rollback();
-      connection.release();
-
-      // Return a clear error to the user
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to send verification email. Please check your email address and try again.',
-        error: 'EMAIL_SEND_FAILED',
-        details: emailError.message // Expose message to help debug
-      });
-    }
-  } catch (error) {
-    // Rollback on any error
-    if (connection) {
-      try {
-        if (connection.state !== 'disconnected') {
-          await connection.rollback();
-          connection.release();
+        token, // Keep sending token for legacy frontend support if needed
+        role: user.role,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role
         }
-      } catch (rollbackErr) {
-        // Already released or error rolling back
-      }
-    }
-
-    console.error('Register error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error',
-      details: error.message
-    });
-  }
-});
-
-app.post('/api/auth/login', authLimiter, validateLogin, async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    const [users] = await pool.query('SELECT * FROM Users WHERE email = ?', [email]);
-    if (users.length === 0) {
-      return res.status(401).json({
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({
         success: false,
-        message: 'Invalid credentials',
-        errors: [{ path: 'email', msg: 'No account found with this email address' }]
+        message: 'Server error: ' + error.message
       });
     }
-
-    const user = users[0];
-
-    // Check if user is verified
-    if (!user.isVerified) {
-      return res.status(401).json({
-        success: false,
-        message: 'Email not verified. Please check your email for the verification code.',
-        requiresVerification: true,
-        email: user.email
-      });
-    }
-
-    // Check if user is blocked (Exclude admins from being blocked to prevent lockout)
-    if (user.isBlocked && user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Account Blocked',
-        errors: [{ path: 'email', msg: 'Your account has been blocked by the administrator.' }]
-      });
-    }
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials',
-        errors: [{ path: 'password', msg: 'Incorrect password' }]
-      });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, role: user.role, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    // Set cookie for production
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: true, // Always true for https
-      sameSite: 'none', // Required for cross-site cookies
-      maxAge: 24 * 60 * 60 * 1000, // 24 hours
-      path: '/',
-    });
-
-    res.json({
-      success: true,
-      token, // Keep sending token for legacy frontend support if needed
-      role: user.role,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error: ' + error.message
-    });
-  }
-});
+  });
 
 // Logout endpoint
 app.post('/api/auth/logout', (req, res) => {
@@ -1663,6 +1797,17 @@ app.put('/api/users/:id/block', adminOnly, validateId, async (req, res) => {
 });
 
 /* ======================
+   ADMIN SECURITY ROUTES
+====================== */
+const securityRoutes = require('./routes/securityRoutes');
+
+// Middleware to attach pool to request for security routes
+app.use('/api/admin/security', adminOnly, (req, res, next) => {
+  req.pool = pool;
+  next();
+}, securityRoutes);
+
+/* ======================
    START SERVER
 ====================== */
 // Cleanup job for expired verification codes and unverified users - runs every hour
@@ -1689,6 +1834,53 @@ cron.schedule('0 * * * *', async () => {
     }
   } catch (error) {
     console.error('❌ Cleanup job error:', error);
+  }
+});
+
+// Security cleanup job - runs every hour
+cron.schedule('0 * * * *', async () => {
+  if (!pool) {
+    console.log('⚠️ Database pool not initialized, skipping security cleanup job');
+    return;
+  }
+  try {
+    // Clean up expired IP blocks
+    const [blockResult] = await pool.query(
+      'DELETE FROM blocked_ips WHERE blocked_until < NOW() AND auto_unblock = TRUE'
+    );
+    if (blockResult.affectedRows > 0) {
+      console.log(`🧹 Cleaned up ${blockResult.affectedRows} expired IP blocks`);
+    }
+
+    // Check for IPs that should be permanently banned
+    const [repeatOffenders] = await pool.query(
+      `SELECT ip FROM blocked_ips 
+       WHERE block_count >= ? AND auto_unblock = TRUE`,
+      [parseInt(process.env.PERMANENT_BAN_THRESHOLD || 10)]
+    );
+
+    if (repeatOffenders.length > 0) {
+      for (const offender of repeatOffenders) {
+        await pool.query(
+          'UPDATE blocked_ips SET auto_unblock = FALSE WHERE ip = ?',
+          [offender.ip]
+        );
+        console.log(`🚫 Permanently banned IP ${offender.ip} (repeat offender)`);
+      }
+    }
+
+    // Clean up old security events (older than retention period)
+    const retentionDays = parseInt(process.env.SECURITY_EVENT_RETENTION_DAYS || 90);
+    const [eventResult] = await pool.query(
+      `DELETE FROM security_events 
+       WHERE timestamp < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+      [retentionDays]
+    );
+    if (eventResult.affectedRows > 0) {
+      console.log(`🧹 Archived ${eventResult.affectedRows} old security events (older than ${retentionDays} days)`);
+    }
+  } catch (error) {
+    console.error('❌ Security cleanup job error:', error);
   }
 });
 
