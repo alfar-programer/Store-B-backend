@@ -983,7 +983,7 @@ app.post('/api/auth/resend-verification', resendLimiter, async (req, res) => {
  * 8. Set httpOnly cookie
  * 9. Return user data
  */
-app.post('/api/auth/google/login', authLimiter, async (req, res) => {
+app.post('/api/auth/google/login', loginLimiter, async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
