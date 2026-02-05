@@ -1533,6 +1533,99 @@ app.get('/api/users', adminOnly, async (req, res) => {
   }
 });
 
+
+/* ======================
+   USER PROFILE ROUTES
+====================== */
+
+// Get User Profile
+app.get('/api/user/profile', authOnly, async (req, res) => {
+  try {
+    const [users] = await pool.query('SELECT id, name, email, role, avatar as profileImage, phone FROM Users WHERE id = ?', [req.user.id]);
+
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json(users[0]);
+  } catch (error) {
+    console.error('Get user profile error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update User Profile (Name Only)
+app.put('/api/user/profile', authOnly, async (req, res) => {
+  try {
+    const { name } = req.body; // Ignore email from body to prevent changes
+
+    if (!name) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+
+    await pool.query('UPDATE Users SET name = ? WHERE id = ?', [name, req.user.id]);
+
+    // Return updated user
+    const [users] = await pool.query('SELECT id, name, email, role, avatar as profileImage FROM Users WHERE id = ?', [req.user.id]);
+
+    res.json(users[0]);
+  } catch (error) {
+    console.error('Update user profile error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update User Profile Image
+app.post('/api/user/profile/image', authOnly, upload.single('profileImage'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image uploaded' });
+    }
+
+    // Upload to Cloudinary
+    const result = await uploadToCloudinary(req.file.buffer, 'avatars');
+    const imageUrl = result.secure_url;
+
+    // Update user in DB
+    await pool.query('UPDATE Users SET avatar = ? WHERE id = ?', [imageUrl, req.user.id]);
+
+    res.json({ profileImage: imageUrl });
+  } catch (error) {
+    console.error('Upload profile image error:', error);
+    res.status(500).json({ error: 'Server error: ' + error.message });
+  }
+});
+
+// Get User Orders (Delivered Only as requested, or filter in frontend?)
+// User requested: "make sure the order history show the order is delivered only"
+// I will implement filtering here for security/correctness.
+app.get('/api/user/orders', authOnly, async (req, res) => {
+  try {
+    // Fetch orders with items
+    const [orders] = await pool.query(
+      `SELECT * FROM Orders WHERE UserId = ? AND status = 'delivered' ORDER BY createdAt DESC`,
+      [req.user.id]
+    );
+
+    // For each order, fetch items (this is N+1 but simple for now, can be optimized)
+    const ordersWithItems = await Promise.all(orders.map(async (order) => {
+      const [items] = await pool.query(
+        `SELECT oi.*, p.title, p.image 
+         FROM OrderItems oi 
+         JOIN Products p ON oi.ProductId = p.id 
+         WHERE oi.OrderId = ?`,
+        [order.id]
+      );
+      return { ...order, items };
+    }));
+
+    res.json(ordersWithItems);
+  } catch (error) {
+    console.error('Get user orders error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.put('/api/users/:id/block', adminOnly, validateId, async (req, res) => {
   try {
     const { isBlocked } = req.body;
