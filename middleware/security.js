@@ -18,7 +18,12 @@ function initializeRedis() {
             maxRetriesPerRequest: 3,
             enableReadyCheck: true,
             retryStrategy(times) {
-                const delay = Math.min(times * 50, 2000);
+                // Stop retrying after 3 attempts to prevent log spam
+                if (times > 3) {
+                    console.warn('⚠️  Redis connection failed 3 times, disabling Redis for this session');
+                    return null;
+                }
+                const delay = Math.min(times * 200, 1000); // Backoff: 200ms, 400ms, 600ms...
                 return delay;
             },
             reconnectOnError(err) {
