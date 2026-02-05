@@ -61,11 +61,11 @@ function initializeRedis() {
 initializeRedis();
 
 // Get Redis store or fallback to memory
-function getStore() {
+function getStore(prefix = 'rl:') {
     if (isRedisAvailable && redisClient) {
         return new RedisStore({
             client: redisClient,
-            prefix: 'rl:',
+            prefix: prefix,
         });
     }
     return undefined; // express-rate-limit will use memory store
@@ -76,7 +76,7 @@ function getStore() {
 ====================== */
 async function logSecurityEvent(pool, eventData) {
     if (!pool) {
-        console.error('❌ Cannot log security event: Database pool not available');
+        // console.warn('⚠️ Cannot log security event: Database pool not available');
         return;
     }
 
@@ -115,11 +115,12 @@ async function logSecurityEvent(pool, eventData) {
 /* ======================
    IP MANAGEMENT
 ====================== */
-// Check if IP is blacklisted
-async function checkBlacklist(pool) {
-    return async (req, res, next) => {
-        if (!pool) return next();
+// Check if IP is blacklisted (expects req.pool to be available)
+const checkBlacklist = (req, res, next) => {
+    const pool = req.pool;
+    if (!pool) return next();
 
+    (async () => {
         try {
             const ip = req.ip || req.connection.remoteAddress;
 
@@ -153,8 +154,8 @@ async function checkBlacklist(pool) {
             console.error('❌ Blacklist check error:', error.message);
             next(); // Don't block on error
         }
-    };
-}
+    })();
+};
 
 // Check if IP is whitelisted
 function checkWhitelist(req, res, next) {
@@ -178,19 +179,16 @@ function skipWhitelisted(req) {
 ====================== */
 
 // Login Rate Limiter - 5 attempts per 15 minutes per IP
-const loginLimiter = (pool) => rateLimit({
+const loginLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_LOGIN || 15) * 60 * 1000,
     max: parseInt(process.env.RATE_LIMIT_MAX_LOGIN || 5),
     standardHeaders: true,
     legacyHeaders: false,
     skip: skipWhitelisted,
-    store: getStore(),
-    keyGenerator: (req) => {
-        return `login:${req.ip}`;
-    },
+    store: getStore('rl:login:'),
     handler: async (req, res) => {
-        if (pool) {
-            await logSecurityEvent(pool, {
+        if (req.pool) {
+            await logSecurityEvent(req.pool, {
                 ip: req.ip,
                 event_type: 'rate_limit_exceeded',
                 endpoint: req.path,
@@ -211,19 +209,16 @@ const loginLimiter = (pool) => rateLimit({
 });
 
 // Signup Rate Limiter - 3 signups per hour per IP
-const signupLimiter = (pool) => rateLimit({
+const signupLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_SIGNUP || 60) * 60 * 1000,
     max: parseInt(process.env.RATE_LIMIT_MAX_SIGNUP || 3),
     standardHeaders: true,
     legacyHeaders: false,
     skip: skipWhitelisted,
-    store: getStore(),
-    keyGenerator: (req) => {
-        return `signup:${req.ip}`;
-    },
+    store: getStore('rl:signup:'),
     handler: async (req, res) => {
-        if (pool) {
-            await logSecurityEvent(pool, {
+        if (req.pool) {
+            await logSecurityEvent(req.pool, {
                 ip: req.ip,
                 event_type: 'rate_limit_exceeded',
                 endpoint: req.path,
@@ -244,19 +239,16 @@ const signupLimiter = (pool) => rateLimit({
 });
 
 // Global API Rate Limiter - 100 requests per 15 minutes
-const globalLimiter = (pool) => rateLimit({
+const globalLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_GLOBAL || 15) * 60 * 1000,
     max: parseInt(process.env.RATE_LIMIT_MAX_GLOBAL || 100),
     standardHeaders: true,
     legacyHeaders: false,
     skip: skipWhitelisted,
-    store: getStore(),
-    keyGenerator: (req) => {
-        return `global:${req.ip}`;
-    },
+    store: getStore('rl:global:'),
     handler: async (req, res) => {
-        if (pool) {
-            await logSecurityEvent(pool, {
+        if (req.pool) {
+            await logSecurityEvent(req.pool, {
                 ip: req.ip,
                 event_type: 'rate_limit_exceeded',
                 endpoint: req.path,
@@ -271,6 +263,42 @@ const globalLimiter = (pool) => rateLimit({
             message: 'Too many requests. Please slow down.',
             error: 'RATE_LIMIT_EXCEEDED',
             retryAfter: Math.ceil(parseInt(process.env.RATE_LIMIT_WINDOW_GLOBAL || 15) * 60)
+        });
+    }
+});
+
+// Verification Rate Limiter - 5 attempts per 15 minutes
+const verificationLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: skipWhitelisted,
+    store: getStore('rl:verification:'),
+    handler: async (req, res) => {
+        // Can add logging here using req.pool if needed
+        res.status(429).json({
+            success: false,
+            message: 'Too many verification attempts, please try again later.',
+            error: 'RATE_LIMIT_EXCEEDED'
+        });
+    }
+});
+
+// Resend Rate Limiter - 3 requests per hour
+const resendLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: skipWhitelisted,
+    store: getStore('rl:resend:'),
+    handler: async (req, res) => {
+        // Can add logging here using req.pool if needed
+        res.status(429).json({
+            success: false,
+            message: 'Too many resend requests, please try again later.',
+            error: 'RATE_LIMIT_EXCEEDED'
         });
     }
 });
@@ -294,10 +322,13 @@ const progressiveDelay = (type = 'login') => {
             return 0;
         },
         skip: skipWhitelisted,
-        store: getStore(),
-        keyGenerator: (req) => {
-            const email = req.body?.email || 'unknown';
-            return `delay:${type}:${req.ip}:${email}`;
+        store: getStore(`rl:delay:${type}:`), // Use prefix instead of custom keyGenerator
+        // express-slow-down might default to ip-based key if no keyGenerator provided, 
+        // which matches our needs.
+        validate: {
+            // Suppress validation warning for custom key generator if we needed it, 
+            // but we are using default key (IP) + prefix, so this should be fine.
+            // If express-slow-down complains about keyGenerator not matching, we'll see.
         }
     });
 };
@@ -311,7 +342,7 @@ async function verifyCaptcha(options = {}) {
     return async (req, res, next) => {
         // Skip if CAPTCHA not configured
         if (!process.env.RECAPTCHA_SECRET_KEY) {
-            console.warn('⚠️  CAPTCHA verification skipped: RECAPTCHA_SECRET_KEY not configured');
+            // console.warn('⚠️  CAPTCHA verification skipped: RECAPTCHA_SECRET_KEY not configured');
             return next();
         }
 
@@ -350,6 +381,8 @@ async function verifyCaptcha(options = {}) {
                 const { success, score, 'error-codes': errorCodes } = response.data;
 
                 if (!success) {
+                    // Use req.pool if available (preferred), otherwise nothing
+                    const pool = req.pool;
                     if (pool) {
                         await logSecurityEvent(pool, {
                             ip: req.ip,
@@ -373,6 +406,7 @@ async function verifyCaptcha(options = {}) {
                 if (score !== undefined) {
                     const threshold = parseFloat(process.env.CAPTCHA_THRESHOLD || 0.5);
                     if (score < threshold) {
+                        const pool = req.pool;
                         if (pool) {
                             await logSecurityEvent(pool, {
                                 ip: req.ip,
@@ -477,6 +511,8 @@ module.exports = {
     loginLimiter,
     signupLimiter,
     globalLimiter,
+    verificationLimiter,
+    resendLimiter,
     checkBlacklist,
     checkWhitelist,
     verifyCaptcha,

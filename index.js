@@ -135,9 +135,12 @@ const {
 
 // Import new security middleware
 const {
+  redisClient,
   loginLimiter,
   signupLimiter,
   globalLimiter,
+  verificationLimiter,
+  resendLimiter,
   checkBlacklist,
   checkWhitelist,
   verifyCaptcha,
@@ -170,21 +173,20 @@ if (process.env.NODE_ENV === 'production') {
 /* ======================
    GLOBAL SECURITY PROTECTION
 ====================== */
-// Check IP blacklist before processing any request (lazy evaluation)
+/* ======================
+   GLOBAL SECURITY PROTECTION
+====================== */
+// Attach pool to request for security middleware logging
 app.use((req, res, next) => {
-  if (pool) {
-    return checkBlacklist(pool)(req, res, next);
-  }
+  req.pool = pool;
   next();
 });
 
-// Apply global rate limiting to all API endpoints (lazy evaluation)
-app.use('/api/', (req, res, next) => {
-  if (pool) {
-    return globalLimiter(pool)(req, res, next);
-  }
-  next();
-});
+// Check IP blacklist before processing any request
+app.use(checkBlacklist);
+
+// Apply global rate limiting to all API endpoints
+app.use('/api/', globalLimiter);
 
 /* ======================
    MIDDLEWARE
@@ -488,7 +490,7 @@ app.get('/api/health', (req, res) => {
 ====================== */
 app.post('/api/auth/register',
   checkWhitelist,
-  signupLimiter(pool),
+  signupLimiter,
   progressiveDelay('signup'),
   validateRegistration,
   async (req, res) => {
@@ -615,7 +617,7 @@ app.post('/api/auth/register',
 app.post('/api/auth/login',
   checkWhitelist,
   progressiveDelay('login'),
-  loginLimiter(pool),
+  loginLimiter,
   validateLogin,
   async (req, res) => {
     try {
@@ -758,26 +760,6 @@ app.post('/api/auth/logout', (req, res) => {
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
   });
   res.json({ success: true, message: 'Logged out successfully' });
-});
-
-// Verification rate limiter - 5 attempts per 15 minutes
-const verificationLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: {
-    success: false,
-    message: 'Too many verification attempts, please try again later.'
-  }
-});
-
-// Resend rate limiter - 3 requests per hour
-const resendLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 3,
-  message: {
-    success: false,
-    message: 'Too many resend requests, please try again later.'
-  }
 });
 
 /* ======================
