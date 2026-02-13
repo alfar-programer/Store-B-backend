@@ -76,9 +76,12 @@ const allowedOrigins = [
   'https://warmtouch.store',
   'https://store-b-frontend.vercel.app',
   'https://store-b-admin.vercel.app',
+  'https://store-b-dashboard-production-b902.up.railway.app',
+  'https://store-b-backend-production-2198.up.railway.app',
   'https://store-b-production.up.railway.app',
   'https://store-b-dashboard-production.up.railway.app',
   'https://store-b-backend-production.up.railway.app',
+  'https://store-b-backend-production-2198.up.railway.app',
   process.env.FRONTEND_URL,
   process.env.ADMIN_URL
 ].filter(Boolean);
