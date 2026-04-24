@@ -1,103 +1,139 @@
 /**
  * Role-Based Access Control (RBAC) Middleware
- * Provides authentication and authorization middleware for API endpoints
+ * ─────────────────────────────────────────────
+ * Provides authentication and authorization middleware for API endpoints.
+ *
+ * Exports:
+ *  - authenticateToken  : Verifies JWT (header or cookie), attaches req.user
+ *  - requireAdmin       : Asserts req.user.role === 'admin'
+ *  - requireAuth        : Asserts req.user exists (any authenticated role)
+ *  - adminOnly          : [authenticateToken, requireAdmin]
+ *  - authOnly           : [authenticateToken, requireAuth]
  */
+
+'use strict';
 
 const jwt = require('jsonwebtoken');
 
-/**
- * Verify JWT token and attach user to request
- */
-const authenticateToken = (req, res, next) => {
-    // Log request details for debugging
-    console.log(`--- Auth Debug [${req.method}] ${req.path} ---`);
-    console.log('Origin:', req.headers.origin);
-    console.log('Authorization Header:', req.headers.authorization ? 'Present' : 'MISSING');
-    console.log('Cookies Present:', req.cookies ? Object.keys(req.cookies) : 'NONE');
+const IS_DEV = process.env.NODE_ENV !== 'production';
 
+/* ─────────────────────────────────────────
+   HELPER — extract token from request
+───────────────────────────────────────── */
+function extractToken(req) {
+    // 1. Authorization: Bearer <token>
     const authHeader = req.headers.authorization;
-    let token = authHeader && authHeader.split(' ')[1];
-
-    if (token === 'undefined' || token === 'null') {
-        console.warn('⚠️ Token is string "undefined" or "null"');
-        token = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.slice(7).trim();
+        // Guard against literal string "undefined" / "null" sent by buggy clients
+        if (token && token !== 'undefined' && token !== 'null') {
+            return token;
+        }
     }
 
-    if (!token && req.cookies) {
-        token = req.cookies.token;
-        if (token) console.log('✅ Found token in cookie');
+    // 2. httpOnly cookie (preferred in production)
+    if (req.cookies && req.cookies.token) {
+        return req.cookies.token;
     }
+
+    return null;
+}
+
+/* ─────────────────────────────────────────
+   authenticateToken
+   Verifies the JWT and attaches the decoded payload to req.user.
+   Returns 401 if no token, 403 if invalid/expired.
+───────────────────────────────────────── */
+const authenticateToken = (req, res, next) => {
+    if (IS_DEV) {
+        console.log(`[Auth] ${req.method} ${req.path}`);
+    }
+
+    const token = extractToken(req);
 
     if (!token) {
-        console.warn('❌ Auth Failed: No token found in headers or cookies');
         return res.status(401).json({
-            success: false,
-            message: 'Access denied. No token provided.'
+            success : false,
+            message : 'Authentication required. Please log in.',
+            code    : 'UNAUTHORIZED',
         });
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        console.log('✅ Auth Success: User ID', decoded.id);
-        next();
-    } catch (error) {
-        console.error('❌ Auth Failed: Invalid/Expired Token -', error.message);
+        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        return next();
+    } catch (err) {
+        const message =
+            err.name === 'TokenExpiredError'
+                ? 'Session expired. Please log in again.'
+                : 'Invalid token. Please log in again.';
+
         return res.status(403).json({
-            success: false,
-            message: 'Invalid or expired token.'
+            success : false,
+            message,
+            code    : err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID',
         });
     }
 };
 
-/**
- * Require admin role
- */
+/* ─────────────────────────────────────────
+   requireAdmin
+   Must be used AFTER authenticateToken.
+   Returns 403 if the authenticated user is not an admin.
+───────────────────────────────────────── */
 const requireAdmin = (req, res, next) => {
     if (!req.user) {
         return res.status(401).json({
-            success: false,
-            message: 'Authentication required.'
+            success : false,
+            message : 'Authentication required.',
+            code    : 'UNAUTHORIZED',
         });
     }
 
     if (req.user.role !== 'admin') {
         return res.status(403).json({
-            success: false,
-            message: 'Access denied. Admin privileges required.'
+            success : false,
+            message : 'Access denied. Administrator privileges required.',
+            code    : 'FORBIDDEN',
         });
     }
 
-    next();
+    return next();
 };
 
-/**
- * Require authentication (any authenticated user)
- */
+/* ─────────────────────────────────────────
+   requireAuth
+   Must be used AFTER authenticateToken.
+   Returns 401 if req.user is somehow absent (belt-and-suspenders).
+───────────────────────────────────────── */
 const requireAuth = (req, res, next) => {
     if (!req.user) {
         return res.status(401).json({
-            success: false,
-            message: 'Authentication required.'
+            success : false,
+            message : 'Authentication required.',
+            code    : 'UNAUTHORIZED',
         });
     }
-    next();
+    return next();
 };
 
-/**
- * Combined middleware: authenticate + require admin
- */
+/* ─────────────────────────────────────────
+   COMBINED MIDDLEWARE CHAINS
+───────────────────────────────────────── */
+
+/** Authenticate + require admin role */
 const adminOnly = [authenticateToken, requireAdmin];
 
-/**
- * Combined middleware: authenticate + require auth
- */
-const authOnly = [authenticateToken, requireAuth];
+/** Authenticate + require any authenticated user */
+const authOnly  = [authenticateToken, requireAuth];
 
+/* ─────────────────────────────────────────
+   EXPORTS
+───────────────────────────────────────── */
 module.exports = {
     authenticateToken,
     requireAdmin,
     requireAuth,
     adminOnly,
-    authOnly
+    authOnly,
 };

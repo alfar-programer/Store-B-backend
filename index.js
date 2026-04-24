@@ -199,19 +199,29 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 /* ======================
    DATABASE POOL
 ====================== */
+// ── Fail fast if critical DB env vars are missing ──────────────────────────
+const _requiredDBEnv = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
+const _missingDBEnv  = _requiredDBEnv.filter(k => !process.env[k]);
+if (_missingDBEnv.length > 0) {
+  console.error(`❌ FATAL: Missing required database environment variables: ${_missingDBEnv.join(', ')}`);
+  process.exit(1);
+}
+
 const DB_CONFIG = {
-  host: process.env.DB_HOST || 'mysql-73b2b04-mazenalfar01.h.aivencloud.com',
-  port: Number(process.env.DB_PORT || 23199),
-  user: process.env.DB_USER || 'avnadmin',
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'defaultdb',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  connectTimeout: 10000,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  host             : process.env.DB_HOST,
+  port             : Number(process.env.DB_PORT || 3306),
+  user             : process.env.DB_USER,
+  password         : process.env.DB_PASSWORD,
+  database         : process.env.DB_NAME,
+  waitForConnections : true,
+  connectionLimit    : 10,
+  queueLimit         : 0,
+  connectTimeout     : 10000,
+  // DB_SSL_CA: base64-encoded CA certificate from your DB provider (e.g. Aiven)
+  // Leave unset to fall back to OS trust store with verification ENABLED in production.
+  ssl: process.env.DB_SSL_CA
+    ? { ca: Buffer.from(process.env.DB_SSL_CA, 'base64') }
+    : { rejectUnauthorized: process.env.NODE_ENV === 'production' },
 };
 
 let pool;
@@ -380,6 +390,27 @@ async function initDatabase() {
     } catch (e) {
       // Column might already exist
     }
+
+    // Create OrderItems table — normalized per-line-item storage
+    // Existing orders store items as a JSON blob in Orders.items;
+    // new orders written via the API will also populate this table.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS OrderItems (
+        id         INT AUTO_INCREMENT PRIMARY KEY,
+        OrderId    INT NOT NULL,
+        ProductId  INT,
+        title      VARCHAR(255) NOT NULL,
+        price      DECIMAL(10, 2) NOT NULL,
+        quantity   INT NOT NULL DEFAULT 1,
+        image      TEXT,
+        discount   INT DEFAULT 0,
+        createdAt  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX      idx_order_id   (OrderId),
+        INDEX      idx_product_id (ProductId),
+        FOREIGN KEY (OrderId)   REFERENCES Orders(id)   ON DELETE CASCADE,
+        FOREIGN KEY (ProductId) REFERENCES Products(id) ON DELETE SET NULL
+      )
+    `);
 
     // Create security_events table
     await connection.query(`
@@ -588,8 +619,8 @@ app.post('/api/auth/register',
         return res.status(500).json({
           success: false,
           message: 'Failed to send verification email. Please check your email address and try again.',
-          error: 'EMAIL_SEND_FAILED',
-          details: emailError.message // Expose message to help debug
+          code: 'EMAIL_SEND_FAILED',
+          ...(process.env.NODE_ENV !== 'production' ? { details: emailError.message } : {})
         });
       }
     } catch (error) {
@@ -608,8 +639,9 @@ app.post('/api/auth/register',
       console.error('Register error:', error);
       res.status(500).json({
         success: false,
-        message: 'Server error',
-        details: error.message
+        message: 'An unexpected error occurred. Please try again.',
+        code: 'INTERNAL_ERROR',
+        ...(process.env.NODE_ENV !== 'production' ? { details: error.message } : {})
       });
     }
   });
@@ -746,8 +778,11 @@ app.post('/api/auth/login',
     } catch (error) {
       console.error('Login error:', error);
       res.status(500).json({
-        success: false,
-        message: 'Server error: ' + error.message
+        success : false,
+        message : process.env.NODE_ENV !== 'production'
+          ? 'Server error: ' + error.message
+          : 'Login failed. Please try again.',
+        code: 'INTERNAL_ERROR'
       });
     }
   });
@@ -1201,11 +1236,66 @@ app.post('/api/auth/google/logout', (req, res) => {
 ====================== */
 app.get('/api/products', async (req, res) => {
   try {
-    const [products] = await pool.query('SELECT * FROM Products');
-    res.json(products);
+    // ── Pagination ──────────────────────────────────────────────────────────
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    // ── Filters ─────────────────────────────────────────────────────────────
+    const search   = req.query.search   ? `%${req.query.search}%`   : null;
+    const category = req.query.category ? req.query.category.trim() : null;
+    const featured = req.query.featured !== undefined
+      ? req.query.featured === 'true'
+      : null;
+
+    // ── Build WHERE clause ───────────────────────────────────────────────────
+    const conditions = [];
+    const params     = [];
+
+    if (search) {
+      conditions.push('(title LIKE ? OR description LIKE ?)');
+      params.push(search, search);
+    }
+    if (category) {
+      conditions.push('category = ?');
+      params.push(category);
+    }
+    if (featured !== null) {
+      conditions.push('isFeatured = ?');
+      params.push(featured ? 1 : 0);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // ── Count total matching rows ────────────────────────────────────────────
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM Products ${where}`,
+      params
+    );
+
+    // ── Fetch page ───────────────────────────────────────────────────────────
+    const [products] = await pool.query(
+      `SELECT * FROM Products ${where} ORDER BY createdAt DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      success    : true,
+      data       : products,
+      pagination : {
+        page,
+        limit,
+        total,
+        pages : Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     console.error('Get products error:', error);
-    res.status(500).json({ message: 'Server error: ' + error.message });
+    res.status(500).json({
+      success : false,
+      message : process.env.NODE_ENV !== 'production' ? error.message : 'Failed to fetch products.',
+      code    : 'INTERNAL_ERROR'
+    });
   }
 });
 
@@ -1386,31 +1476,70 @@ app.post('/api/orders', authOnly, validateOrder, async (req, res) => {
 
 app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
-    let query = `
-      SELECT o.*, u.email as userEmail, u.phone as userPhone, u.name as userName 
-      FROM Orders o 
-      LEFT JOIN Users u ON o.UserId = u.id
-    `;
-    let params = [];
+    // ── Pagination ──────────────────────────────────────────────────────────
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    // ── Filters ─────────────────────────────────────────────────────────────
+    const statusFilter = req.query.status || null;
+    const search       = req.query.search ? `%${req.query.search}%` : null;
+
+    // ── Build WHERE clause ───────────────────────────────────────────────────
+    const conditions = [];
+    const params     = [];
 
     // Non-admin users can only see their own orders
     if (req.user.role !== 'admin') {
-      query += ' WHERE o.UserId = ?';
+      conditions.push('o.UserId = ?');
       params.push(req.user.id);
     }
+    if (statusFilter) {
+      conditions.push('o.status = ?');
+      params.push(statusFilter);
+    }
+    if (search) {
+      conditions.push('(o.customerName LIKE ? OR u.email LIKE ?)');
+      params.push(search, search);
+    }
 
-    query += ' ORDER BY o.createdAt DESC';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const [orders] = await pool.query(query, params);
+    // ── Count total matching rows ────────────────────────────────────────────
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total
+       FROM Orders o LEFT JOIN Users u ON o.UserId = u.id
+       ${where}`,
+      params
+    );
+
+    // ── Fetch page ───────────────────────────────────────────────────────────
+    const [orders] = await pool.query(
+      `SELECT o.*, u.email AS userEmail, u.phone AS userPhone, u.name AS userName
+       FROM Orders o
+       LEFT JOIN Users u ON o.UserId = u.id
+       ${where}
+       ORDER BY o.createdAt DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
     res.json({
-      success: true,
-      data: orders
+      success    : true,
+      data       : orders,
+      pagination : {
+        page,
+        limit,
+        total,
+        pages : Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     console.error('Get orders error:', error);
     res.status(500).json({
-      success: false,
-      message: 'Server error: ' + error.message
+      success : false,
+      message : process.env.NODE_ENV !== 'production' ? error.message : 'Failed to fetch orders.',
+      code    : 'INTERNAL_ERROR'
     });
   }
 });
@@ -1635,16 +1764,66 @@ app.delete('/api/categories/:id', adminOnly, validateId, async (req, res) => {
 ====================== */
 app.get('/api/users', adminOnly, async (req, res) => {
   try {
-    const [users] = await pool.query('SELECT id, name, email, role, phone, isVerified, isBlocked, createdAt FROM Users ORDER BY createdAt DESC');
+    // ── Pagination ──────────────────────────────────────────────────────────
+    const page   = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    // ── Filters ─────────────────────────────────────────────────────────────
+    const search  = req.query.search ? `%${req.query.search}%` : null;
+    const role    = req.query.role   || null;
+    const blocked = req.query.blocked !== undefined ? req.query.blocked === 'true' : null;
+
+    // ── Build WHERE clause ───────────────────────────────────────────────────
+    const conditions = [];
+    const params     = [];
+
+    if (search) {
+      conditions.push('(name LIKE ? OR email LIKE ?)');
+      params.push(search, search);
+    }
+    if (role) {
+      conditions.push('role = ?');
+      params.push(role);
+    }
+    if (blocked !== null) {
+      conditions.push('isBlocked = ?');
+      params.push(blocked ? 1 : 0);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // ── Count total matching rows ────────────────────────────────────────────
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM Users ${where}`,
+      params
+    );
+
+    // ── Fetch page ───────────────────────────────────────────────────────────
+    const [users] = await pool.query(
+      `SELECT id, name, email, role, phone, isVerified, isBlocked, createdAt
+       FROM Users ${where}
+       ORDER BY createdAt DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
     res.json({
-      success: true,
-      data: users
+      success    : true,
+      data       : users,
+      pagination : {
+        page,
+        limit,
+        total,
+        pages : Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({
-      success: false,
-      message: 'Server error: ' + error.message
+      success : false,
+      message : process.env.NODE_ENV !== 'production' ? error.message : 'Failed to fetch users.',
+      code    : 'INTERNAL_ERROR'
     });
   }
 });
@@ -1717,28 +1896,56 @@ app.post('/api/user/profile/image', authOnly, upload.single('profileImage'), asy
 // I will implement filtering here for security/correctness.
 app.get('/api/user/orders', authOnly, async (req, res) => {
   try {
-    // Fetch orders with items
+    // Fetch delivered orders for the authenticated user
+    // MySQL status values are mixed-case ('Delivered'), so we use LOWER() for safety
     const [orders] = await pool.query(
-      `SELECT * FROM Orders WHERE UserId = ? AND status = 'delivered' ORDER BY createdAt DESC`,
+      `SELECT * FROM Orders
+       WHERE UserId = ? AND LOWER(status) = 'delivered'
+       ORDER BY createdAt DESC`,
       [req.user.id]
     );
 
-    // For each order, fetch items (this is N+1 but simple for now, can be optimized)
+    // Enrich each order with its line items.
+    // Strategy: try OrderItems table first (new normalized rows); fall back to
+    // parsing the legacy JSON blob stored in Orders.items for older orders.
     const ordersWithItems = await Promise.all(orders.map(async (order) => {
-      const [items] = await pool.query(
-        `SELECT oi.*, p.title, p.image 
-         FROM OrderItems oi 
-         JOIN Products p ON oi.ProductId = p.id 
-         WHERE oi.OrderId = ?`,
+      // Try normalized OrderItems table
+      const [normalizedItems] = await pool.query(
+        `SELECT oi.id, oi.title, oi.price, oi.quantity, oi.image, oi.discount,
+                p.id AS productId
+         FROM   OrderItems oi
+         LEFT JOIN Products p ON oi.ProductId = p.id
+         WHERE  oi.OrderId = ?`,
         [order.id]
       );
-      return { ...order, items };
+
+      let items = normalizedItems;
+
+      // Fall back: parse JSON blob for legacy orders that predate OrderItems table
+      if (items.length === 0 && order.items) {
+        try {
+          const parsed = typeof order.items === 'string'
+            ? JSON.parse(order.items)
+            : order.items;
+          items = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          items = [];
+        }
+      }
+
+      // Strip the raw blob from the response
+      const { items: _raw, ...orderData } = order;
+      return { ...orderData, items };
     }));
 
-    res.json(ordersWithItems);
+    res.json({ success: true, data: ordersWithItems });
   } catch (error) {
     console.error('Get user orders error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({
+      success : false,
+      message : process.env.NODE_ENV !== 'production' ? error.message : 'Failed to fetch orders.',
+      code    : 'INTERNAL_ERROR'
+    });
   }
 });
 
@@ -1866,14 +2073,31 @@ cron.schedule('0 * * * *', async () => {
   }
 });
 
+/* ======================
+   ERROR HANDLING (must be last middleware)
+====================== */
+const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
+
+// 404 — no route matched
+app.use(notFoundHandler);
+
+// Global error handler — receives errors from next(err) and thrown async errors
+app.use(errorHandler);
+
+/* ======================
+   START SERVER
+====================== */
 initDatabase()
   .then(() => {
-    console.log('✅ Database connected');
-    app.listen(PORT, () =>
-      console.log(`🚀 Server running on port ${PORT}`)
-    );
+    console.log('✅ Database initialized');
+    app.listen(PORT, () => {
+      console.log(`\n🚀 Server running on port ${PORT}`);
+      console.log(`   Environment : ${process.env.NODE_ENV || 'development'}`);
+      console.log(`   DB Host     : ${process.env.DB_HOST}`);
+      console.log(`   Port        : ${PORT}\n`);
+    });
   })
   .catch(err => {
-    console.error('❌ DB Error:', err);
+    console.error('❌ Failed to start server — DB initialization error:', err.message);
     process.exit(1);
   });
