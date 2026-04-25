@@ -412,6 +412,21 @@ async function initDatabase() {
       )
     `);
 
+    // Create ProductRecommendations table First
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS ProductRecommendations (
+        sourceProductId INT NOT NULL,
+        targetProductId INT NOT NULL,
+        score FLOAT DEFAULT 0.0,
+        isPinned BOOLEAN DEFAULT FALSE,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (sourceProductId, targetProductId),
+        FOREIGN KEY (sourceProductId) REFERENCES Products(id) ON DELETE CASCADE,
+        FOREIGN KEY (targetProductId) REFERENCES Products(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
     // Create security_events table
     await connection.query(`
       CREATE TABLE IF NOT EXISTS security_events (
@@ -1309,6 +1324,357 @@ app.get('/api/products/featured', async (req, res) => {
   }
 });
 
+app.get('/api/products/:id', validateId, async (req, res) => {
+  try {
+    const [products] = await pool.query('SELECT * FROM Products WHERE id = ?', [req.params.id]);
+    if (products.length === 0) {
+      return res.status(404).json({ success: false, message: `Product with ID ${req.params.id} not found`, code: 'NOT_FOUND' });
+    }
+    const product = products[0];
+
+    // Compute dynamic rating
+    const [ratingData] = await pool.query(`
+      SELECT 
+        AVG(rating) AS average,
+        COUNT(*) AS count,
+        SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END) AS five,
+        SUM(CASE WHEN rating = 4 THEN 1 ELSE 0 END) AS four,
+        SUM(CASE WHEN rating = 3 THEN 1 ELSE 0 END) AS three,
+        SUM(CASE WHEN rating = 2 THEN 1 ELSE 0 END) AS two,
+        SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS one
+      FROM Reviews
+      WHERE productId = ? AND status = 'approved'
+    `, [req.params.id]);
+
+    const r = ratingData[0];
+    product.rating = {
+      average: r.average ? parseFloat(Number(r.average).toFixed(1)) : 0,
+      count: Number(r.count) || 0,
+      distribution: {
+        "5": Number(r.five) || 0,
+        "4": Number(r.four) || 0,
+        "3": Number(r.three) || 0,
+        "2": Number(r.two) || 0,
+        "1": Number(r.one) || 0
+      }
+    };
+
+    // Return structured response as expected by frontend pattern
+    res.json({ success: true, data: product });
+  } catch (error) {
+    console.error('Get product by id error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message, code: 'INTERNAL_ERROR' });
+  }
+});
+
+// ==========================================
+// RECOMMENDATIONS API
+// ==========================================
+
+// Get product recommendations
+app.get('/api/products/:id/recommendations', async (req, res) => {
+  try {
+    const productId = req.params.id;
+    // Tier 1: Pinned
+    const [pinned] = await pool.query(`
+      SELECT p.* FROM ProductRecommendations pr
+      JOIN Products p ON pr.targetProductId = p.id
+      WHERE pr.sourceProductId = ? AND pr.isPinned = TRUE
+    `, [productId]);
+
+    // Tier 2: Computed
+    const [computed] = await pool.query(`
+      SELECT p.*, pr.score FROM ProductRecommendations pr
+      JOIN Products p ON pr.targetProductId = p.id
+      WHERE pr.sourceProductId = ? AND pr.isPinned = FALSE AND pr.score > 0
+      ORDER BY pr.score DESC
+      LIMIT 8
+    `, [productId]);
+
+    // Tier 3: Featured fallback
+    const [featuredFallback] = await pool.query(`
+      SELECT * FROM Products 
+      WHERE isFeatured = 1 AND id != ?
+      LIMIT 8
+    `, [productId]);
+
+    // Merge and deduplicate
+    const merged = [];
+    const seen = new Set();
+    // Exclude source product
+    seen.add(parseInt(productId));
+
+    // Excluded products (score = -1) -- we must ensure they aren't added by fallback
+    const [excludedIdsRaw] = await pool.query(`
+      SELECT targetProductId FROM ProductRecommendations 
+      WHERE sourceProductId = ? AND score < 0
+    `, [productId]);
+    excludedIdsRaw.forEach(r => seen.add(r.targetProductId));
+
+    const addProducts = (products) => {
+      for (const p of products) {
+        if (!seen.has(p.id) && merged.length < 8) {
+          merged.push(p);
+          seen.add(p.id);
+        }
+      }
+    };
+
+    addProducts(pinned);
+    addProducts(computed);
+    addProducts(featuredFallback);
+
+    res.json({ success: true, data: merged });
+  } catch (error) {
+    console.error('Get recommendations error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Admin: Update product recommendations (Pinned / Excluded)
+app.put('/api/admin/products/:id/recommendations', adminOnly, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const sourceProductId = req.params.id;
+    const { pinned, excluded } = req.body;
+
+    await connection.beginTransaction();
+
+    // Delete existing manually set recommendations for this source product
+    await connection.query(`
+       DELETE FROM ProductRecommendations 
+       WHERE sourceProductId = ? AND (isPinned = TRUE OR score < 0)
+    `, [sourceProductId]);
+
+    // Insert new pinned
+    if (pinned && pinned.length > 0) {
+      for (const targetId of pinned) {
+        if (!targetId || targetId === parseInt(sourceProductId)) continue;
+        await connection.query(`
+          INSERT INTO ProductRecommendations (sourceProductId, targetProductId, isPinned, score)
+          VALUES (?, ?, TRUE, 1.0)
+          ON DUPLICATE KEY UPDATE isPinned = TRUE, score = 1.0
+        `, [sourceProductId, targetId]);
+      }
+    }
+
+    // Insert new excluded (score = -1.0)
+    if (excluded && excluded.length > 0) {
+      for (const targetId of excluded) {
+        if (!targetId || targetId === parseInt(sourceProductId)) continue;
+        await connection.query(`
+          INSERT INTO ProductRecommendations (sourceProductId, targetProductId, isPinned, score)
+          VALUES (?, ?, FALSE, -1.0)
+          ON DUPLICATE KEY UPDATE isPinned = FALSE, score = -1.0
+        `, [sourceProductId, targetId]);
+      }
+    }
+
+    await connection.commit();
+    res.json({ success: true, message: 'Recommendations updated successfully' });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Admin update recommendations error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ==========================================
+// REVIEWS API
+// ==========================================
+
+// Get reviews for a product
+app.get('/api/products/:id/reviews', async (req, res) => {
+  try {
+    const productId = req.params.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const ratingFilter = req.query.rating;
+    const sort = req.query.sort || 'recent';
+
+    let query = `
+      SELECT r.id, r.rating, r.title, r.body, r.helpfulCount, r.createdAt, r.orderId,
+             u.name as userName 
+      FROM Reviews r
+      JOIN Users u ON r.userId = u.id
+      WHERE r.productId = ? AND r.status = 'approved'
+    `;
+    const queryParams = [productId];
+
+    if (ratingFilter && ratingFilter !== 'all') {
+      query += ` AND r.rating = ?`;
+      queryParams.push(ratingFilter);
+    }
+
+    if (sort === 'highest') {
+      query += ` ORDER BY r.rating DESC, r.createdAt DESC`;
+    } else if (sort === 'lowest') {
+      query += ` ORDER BY r.rating ASC, r.createdAt DESC`;
+    } else if (sort === 'helpful') {
+      query += ` ORDER BY r.helpfulCount DESC, r.createdAt DESC`;
+    } else { // recent
+      query += ` ORDER BY r.createdAt DESC`;
+    }
+
+    query += ` LIMIT ? OFFSET ?`;
+    queryParams.push(limit, offset);
+
+    const [reviews] = await pool.query(query, queryParams);
+
+    let countQuery = `SELECT COUNT(*) as total FROM Reviews WHERE productId = ? AND status = 'approved'`;
+    const countParams = [productId];
+    if (ratingFilter && ratingFilter !== 'all') {
+      countQuery += ` AND rating = ?`;
+      countParams.push(ratingFilter);
+    }
+    const [countResult] = await pool.query(countQuery, countParams);
+    const total = countResult[0].total;
+
+    res.json({
+      success: true,
+      data: reviews.map(r => ({
+        id: r.id,
+        rating: r.rating,
+        title: r.title,
+        body: r.body,
+        helpfulCount: r.helpfulCount,
+        createdAt: r.createdAt,
+        verifiedPurchase: !!r.orderId,
+        user: {
+          name: r.userName || 'Anonymous'
+        }
+      })),
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('Get reviews error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Submit a review
+app.post('/api/products/:id/reviews', authOnly, async (req, res) => {
+  try {
+    const productId = req.params.id;
+    const userId = req.user.id;
+    const { rating, title, body } = req.body;
+
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ success: false, message: 'Rating must be between 1 and 5' });
+    }
+    if (!body) {
+      return res.status(400).json({ success: false, message: 'Review body is required' });
+    }
+
+    // Verify purchase
+    const [delivered] = await pool.query(`
+      SELECT o.id FROM Orders o
+      JOIN OrderItems oi ON oi.orderId = o.id
+      WHERE o.userId = ? 
+      AND o.status = 'Delivered'
+      AND oi.productId = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM Reviews r 
+        WHERE r.orderId = o.id AND r.productId = ? AND r.userId = ?
+      )
+      LIMIT 1
+    `, [userId, productId, productId, userId]);
+
+    if (!delivered.length) {
+      return res.status(403).json({ success: false, message: 'Only verified buyers can review this product, or you have already reviewed it.' });
+    }
+
+    const orderId = delivered[0].id;
+
+    await pool.query(`
+      INSERT INTO Reviews (productId, userId, orderId, rating, title, body, status)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending')
+    `, [productId, userId, orderId, rating, title || null, body]);
+
+    res.status(201).json({ success: true, message: 'Review submitted successfully. It will appear after moderation.' });
+  } catch (error) {
+    console.error('Submit review error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Mark review as helpful
+app.put('/api/reviews/:id/helpful', async (req, res) => {
+  try {
+    await pool.query('UPDATE Reviews SET helpfulCount = helpfulCount + 1 WHERE id = ?', [req.params.id]);
+    res.json({ success: true, message: 'Marked as helpful' });
+  } catch (error) {
+    console.error('Mark helpful error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Mark review as unhelpful
+app.put('/api/reviews/:id/unhelpful', async (req, res) => {
+  try {
+    await pool.query('UPDATE Reviews SET unhelpfulCount = unhelpfulCount + 1 WHERE id = ?', [req.params.id]);
+    res.json({ success: true, message: 'Marked as unhelpful' });
+  } catch (error) {
+    console.error('Mark unhelpful error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Admin: Get all reviews
+app.get('/api/admin/reviews', adminOnly, async (req, res) => {
+  try {
+    const status = req.query.status || 'all';
+    
+    let query = `
+      SELECT r.*, p.title as productTitle, u.name as userName 
+      FROM Reviews r
+      JOIN Products p ON r.productId = p.id
+      JOIN Users u ON r.userId = u.id
+    `;
+    const queryParams = [];
+
+    if (status !== 'all') {
+      query += ` WHERE r.status = ?`;
+      queryParams.push(status);
+    }
+    
+    query += ` ORDER BY r.createdAt DESC`;
+
+    const [reviews] = await pool.query(query, queryParams);
+    
+    res.json({ success: true, data: reviews });
+  } catch (error) {
+    console.error('Admin get reviews error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// Admin: Update review status
+app.put('/api/admin/reviews/:id/status', adminOnly, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!['pending', 'approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+
+    await pool.query('UPDATE Reviews SET status = ? WHERE id = ?', [status, req.params.id]);
+    
+    res.json({ success: true, message: `Review ${status}` });
+  } catch (error) {
+    console.error('Admin update review status error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
 app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct, async (req, res) => {
   try {
     console.log('📦 Received Product Creation Request');
@@ -1440,37 +1806,68 @@ app.post('/api/categories', adminOnly, upload.single('image'), validateCategory,
    ORDERS
 ====================== */
 app.post('/api/orders', authOnly, validateOrder, async (req, res) => {
+  const connection = await pool.getConnection();
   try {
     const { customerName, total, status, items, shippingAddress } = req.body;
-    const UserId = req.user.id; // Use authenticated user's ID
+    const UserId = req.user.id; 
 
-    console.log('📝 New Order Received:', {
-      customer: customerName,
-      total: total,
-      hasItems: !!items,
-      hasShipping: !!shippingAddress
-    });
-
-    if (shippingAddress) {
-      console.log('📍 Shipping Address details:', JSON.stringify(shippingAddress, null, 2));
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: 'Order items are required' });
     }
 
-    const [result] = await pool.query(
+    await connection.beginTransaction();
+
+    // 1. Verify stock for all items first
+    for (const item of items) {
+      const [products] = await connection.query('SELECT stock, title FROM Products WHERE id = ?', [item.id || item.productId]);
+      if (products.length === 0) {
+        throw new Error(`Product with ID ${item.id || item.productId} not found`);
+      }
+      const product = products[0];
+      if (product.stock < item.quantity) {
+        throw new Error(`Insufficient stock for "${product.title}". Available: ${product.stock}, Requested: ${item.quantity}`);
+      }
+    }
+
+    // 2. Deduct stock and record items
+    for (const item of items) {
+      await connection.query(
+        'UPDATE Products SET stock = stock - ? WHERE id = ?',
+        [item.quantity, item.id || item.productId]
+      );
+    }
+
+    // 3. Create Order
+    const [result] = await connection.query(
       'INSERT INTO Orders (customerName, total, status, items, UserId, shippingAddress) VALUES (?, ?, ?, ?, ?, ?)',
       [customerName, total, status || 'Pending', JSON.stringify(items), UserId, JSON.stringify(shippingAddress)]
     );
 
-    const [orders] = await pool.query('SELECT * FROM Orders WHERE id = ?', [result.insertId]);
+    // 4. Create OrderItems entries (for reporting and review validation)
+    for (const item of items) {
+      await connection.query(
+        'INSERT INTO OrderItems (orderId, productId, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?)',
+        [result.insertId, item.id || item.productId, item.quantity, item.price, (item.price * item.quantity)]
+      );
+    }
+
+    await connection.commit();
+
+    const [orders] = await connection.query('SELECT * FROM Orders WHERE id = ?', [result.insertId]);
     res.json({
       success: true,
-      data: orders[0]
+      data: orders[0],
+      message: 'Order placed successfully and stock updated'
     });
   } catch (error) {
+    await connection.rollback();
     console.error('Create order error:', error);
-    res.status(500).json({
+    res.status(400).json({
       success: false,
-      message: 'Server error: ' + error.message
+      message: error.message || 'Failed to create order'
     });
+  } finally {
+    connection.release();
   }
 });
 
@@ -2071,6 +2468,67 @@ cron.schedule('0 * * * *', async () => {
   } catch (error) {
     console.error('❌ Security cleanup job error:', error);
   }
+});
+
+/* ======================
+   RECOMMENDATIONS CRON
+====================== */
+const runRecommendationCron = async () => {
+  console.log('🔄 Starting Nightly Product Recommendation Cron Job...');
+  try {
+    const [products] = await pool.query('SELECT * FROM Products');
+    
+    // Clear old computable rows (not pinned and not excluded)
+    await pool.query('DELETE FROM ProductRecommendations WHERE isPinned = FALSE AND score >= 0');
+    
+    let inserts = 0;
+    
+    for (const p1 of products) {
+      for (const p2 of products) {
+        if (p1.id === p2.id) continue;
+        
+        let score = 0;
+        
+        // Category match
+        if (p1.category === p2.category) score += 0.6;
+        
+        // Rating match (0.3 max)
+        const p1Rating = parseFloat(p1.rating) || 0;
+        const p2Rating = parseFloat(p2.rating) || 0;
+        const ratingDiff = Math.abs(p1Rating - p2Rating);
+        score += Math.max(0, (1 - (ratingDiff / 5)) * 0.3);
+        
+        // Featured
+        if (p2.isFeatured) score += 0.1;
+        
+        if (score > 0.3) {
+          // Check if it's already manually excluded or pinned
+          const [existing] = await pool.query(
+            'SELECT * FROM ProductRecommendations WHERE sourceProductId = ? AND targetProductId = ?',
+            [p1.id, p2.id]
+          );
+          
+          if (existing.length === 0) {
+             await pool.query(`
+               INSERT INTO ProductRecommendations (sourceProductId, targetProductId, score, isPinned)
+               VALUES (?, ?, ?, FALSE)
+             `, [p1.id, p2.id, score]);
+             inserts++;
+          }
+        }
+      }
+    }
+    console.log(`✅ Nightly Cron Job Finished. Inserted ${inserts} new recommendations.`);
+  } catch (error) {
+    console.error('❌ Cron Job Error:', error);
+  }
+};
+
+cron.schedule('0 2 * * *', runRecommendationCron);
+
+app.post('/api/admin/recommendations/run', adminOnly, async (req, res) => {
+  runRecommendationCron().catch(console.error);
+  res.json({ success: true, message: 'Cron job started in background' });
 });
 
 /* ======================
