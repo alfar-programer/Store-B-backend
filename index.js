@@ -1590,7 +1590,7 @@ app.post('/api/products/:id/reviews', authOnly, async (req, res) => {
     `, [userId, productId, productId, userId]);
 
     if (!delivered.length) {
-      return res.status(403).json({ success: false, message: 'Only verified buyers can review this product, or you have already reviewed it.' });
+      return res.status(403).json({ success: false, message: 'Only who bought this product can review it, or you have already reviewed it.' });
     }
 
     const orderId = delivered[0].id;
