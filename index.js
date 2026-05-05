@@ -252,7 +252,9 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS Products (
         id INT AUTO_INCREMENT PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
+        title_ar VARCHAR(255) NULL,
         description TEXT NOT NULL,
+        description_ar TEXT NULL,
         price DECIMAL(10, 2) NOT NULL,
         category VARCHAR(255) NOT NULL,
         stock INT DEFAULT 0,
@@ -265,17 +267,55 @@ async function initDatabase() {
       )
     `);
 
+    // Add Arabic content columns to existing Products table (safe migration)
+    try {
+      await connection.query('ALTER TABLE Products ADD COLUMN title_ar VARCHAR(255) NULL AFTER title');
+      console.log('✅ Added title_ar column to Products table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  title_ar column already exists or other error:', e.message);
+      }
+    }
+    try {
+      await connection.query('ALTER TABLE Products ADD COLUMN description_ar TEXT NULL AFTER description');
+      console.log('✅ Added description_ar column to Products table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  description_ar column already exists or other error:', e.message);
+      }
+    }
+
     // Create Categories table
     await connection.query(`
       CREATE TABLE IF NOT EXISTS Categories (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(255) UNIQUE NOT NULL,
+        name_ar VARCHAR(255) NULL,
         description TEXT,
+        description_ar TEXT NULL,
         image TEXT,
         createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+
+    // Add Arabic content columns to existing Categories table (safe migration)
+    try {
+      await connection.query('ALTER TABLE Categories ADD COLUMN name_ar VARCHAR(255) NULL AFTER name');
+      console.log('✅ Added name_ar column to Categories table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  name_ar column already exists or other error:', e.message);
+      }
+    }
+    try {
+      await connection.query('ALTER TABLE Categories ADD COLUMN description_ar TEXT NULL AFTER description');
+      console.log('✅ Added description_ar column to Categories table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate column')) {
+        console.log('ℹ️  description_ar column already exists or other error:', e.message);
+      }
+    }
 
     // Create Users table
     await connection.query(`
@@ -1268,8 +1308,9 @@ app.get('/api/products', async (req, res) => {
     const params     = [];
 
     if (search) {
-      conditions.push('(title LIKE ? OR description LIKE ?)');
-      params.push(search, search);
+      // Search across both English and Arabic title/description fields
+      conditions.push('(title LIKE ? OR description LIKE ? OR title_ar LIKE ? OR description_ar LIKE ?)');
+      params.push(search, search, search, search);
     }
     if (category) {
       conditions.push('category = ?');
@@ -1681,7 +1722,8 @@ app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct
     console.log('Files:', req.files ? req.files.length : '0');
     console.log('Body:', JSON.stringify(req.body, null, 2));
 
-    const { title, description, price, category, stock, discount, rating, isFeatured } = req.body;
+    // Destructure both English and Arabic fields
+    const { title, title_ar, description, description_ar, price, category, stock, discount, rating, isFeatured } = req.body;
 
     let imageUrls = [];
 
@@ -1713,9 +1755,21 @@ app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct
     const imageJson = JSON.stringify(imageUrls);
 
     const [result] = await pool.query(
-      `INSERT INTO Products (title, description, price, category, stock, image, discount, rating, isFeatured) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [title, description, price, category, stock || 0, imageJson, discount || 0, rating || 4.5, isFeatured === 'true' || isFeatured === true ? 1 : 0]
+      `INSERT INTO Products (title, title_ar, description, description_ar, price, category, stock, image, discount, rating, isFeatured) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        title,
+        title_ar || null,
+        description,
+        description_ar || null,
+        price,
+        category,
+        stock || 0,
+        imageJson,
+        discount || 0,
+        rating || 4.5,
+        isFeatured === 'true' || isFeatured === true ? 1 : 0
+      ]
     );
 
     const [products] = await pool.query('SELECT * FROM Products WHERE id = ?', [result.insertId]);
@@ -1747,7 +1801,7 @@ app.get('/api/categories', async (req, res) => {
 
 app.post('/api/categories', adminOnly, upload.single('image'), validateCategory, async (req, res) => {
   try {
-    const { name, description } = req.body;
+    const { name, name_ar, description, description_ar } = req.body;
 
     console.log('📝 Creating category:', name);
     console.log('📎 File received:', req.file ? 'Yes' : 'No');
@@ -1776,8 +1830,8 @@ app.post('/api/categories', adminOnly, upload.single('image'), validateCategory,
     }
 
     const [result] = await pool.query(
-      'INSERT INTO Categories (name, description, image) VALUES (?, ?, ?)',
-      [name, description, imageUrl]
+      'INSERT INTO Categories (name, name_ar, description, description_ar, image) VALUES (?, ?, ?, ?, ?)',
+      [name, name_ar || null, description, description_ar || null, imageUrl]
     );
 
     const [categories] = await pool.query('SELECT * FROM Categories WHERE id = ?', [result.insertId]);
@@ -2042,9 +2096,21 @@ app.get('/api/stats', adminOnly, async (req, res) => {
 ====================== */
 app.put('/api/products/:id', adminOnly, validateId, upload.array('images', 10), async (req, res) => {
   try {
-    const { title, description, price, category, stock, discount, rating, isFeatured } = req.body;
-    let query = 'UPDATE Products SET title=?, description=?, price=?, category=?, stock=?, discount=?, rating=?, isFeatured=?';
-    let params = [title, description, price, category, stock, discount, rating, isFeatured === 'true' || isFeatured === true ? 1 : 0];
+    const { title, title_ar, description, description_ar, price, category, stock, discount, rating, isFeatured } = req.body;
+    // Include both English and Arabic fields in update
+    let query = 'UPDATE Products SET title=?, title_ar=?, description=?, description_ar=?, price=?, category=?, stock=?, discount=?, rating=?, isFeatured=?';
+    let params = [
+      title,
+      title_ar || null,
+      description,
+      description_ar || null,
+      price,
+      category,
+      stock,
+      discount,
+      rating,
+      isFeatured === 'true' || isFeatured === true ? 1 : 0
+    ];
 
     // Handle Image Updates
     // Strategy: If new images are uploaded, we replace the existing ones (simple approach).
@@ -2099,9 +2165,9 @@ app.delete('/api/products/:id', adminOnly, validateId, async (req, res) => {
 ====================== */
 app.put('/api/categories/:id', adminOnly, validateId, upload.single('image'), validateCategory, async (req, res) => {
   try {
-    const { name, description } = req.body;
-    let query = 'UPDATE Categories SET name=?, description=?';
-    let params = [name, description];
+    const { name, name_ar, description, description_ar } = req.body;
+    let query = 'UPDATE Categories SET name=?, name_ar=?, description=?, description_ar=?';
+    let params = [name, name_ar || null, description, description_ar || null];
 
     console.log('📝 Updating category:', req.params.id);
     console.log('📎 New file received:', req.file ? 'Yes' : 'No');

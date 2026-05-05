@@ -72,10 +72,22 @@ const validateProduct = [
         .notEmpty().withMessage('Title is required')
         .isLength({ min: 3, max: 255 }).withMessage('Title must be 3-255 characters'),
 
+    // Arabic title is optional — admin can save without it
+    body('title_ar')
+        .optional({ nullable: true, checkFalsy: true })
+        .trim()
+        .isLength({ min: 2, max: 255 }).withMessage('Arabic title must be 2-255 characters'),
+
     body('description')
         .trim()
         .notEmpty().withMessage('Description is required')
         .isLength({ min: 1, max: 5000 }).withMessage('Description must be 1-5000 characters'),
+
+    // Arabic description is optional
+    body('description_ar')
+        .optional({ nullable: true, checkFalsy: true })
+        .trim()
+        .isLength({ min: 1, max: 5000 }).withMessage('Arabic description must be 1-5000 characters'),
 
     body('price')
         .notEmpty().withMessage('Price is required')
@@ -113,10 +125,22 @@ const validateCategory = [
         .notEmpty().withMessage('Category name is required')
         .isLength({ min: 2, max: 100 }).withMessage('Category name must be 2-100 characters'),
 
+    // Arabic name is optional
+    body('name_ar')
+        .optional({ nullable: true, checkFalsy: true })
+        .trim()
+        .isLength({ min: 2, max: 100 }).withMessage('Arabic category name must be 2-100 characters'),
+
     body('description')
         .optional()
         .trim()
         .isLength({ max: 500 }).withMessage('Description must not exceed 500 characters'),
+
+    // Arabic description is optional
+    body('description_ar')
+        .optional({ nullable: true, checkFalsy: true })
+        .trim()
+        .isLength({ max: 500 }).withMessage('Arabic description must not exceed 500 characters'),
 
     handleValidationErrors
 ];
