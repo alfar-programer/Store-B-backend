@@ -1,4 +1,5 @@
 const Redis = require('ioredis');
+const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis');
 const slowDown = require('express-slow-down');
@@ -179,6 +180,33 @@ function skipWhitelisted(req) {
     return req.isWhitelisted === true;
 }
 
+// Skip rate limiting for admin accounts OR whitelisted IPs
+function skipIfAdmin(req) {
+    if (req.isWhitelisted === true) return true;
+
+    try {
+        // Extract token from Authorization header or cookie
+        let token = null;
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            const t = authHeader.slice(7).trim();
+            if (t && t !== 'undefined' && t !== 'null') token = t;
+        }
+        if (!token && req.cookies && req.cookies.token) {
+            token = req.cookies.token;
+        }
+
+        if (!token) return false;
+
+        // Verify the token (safe: uses the same secret as authenticateToken)
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        return decoded?.role === 'admin';
+    } catch {
+        // Invalid / expired token — fall through to normal rate limiting
+        return false;
+    }
+}
+
 /* ======================
    RATE LIMITERS
 ====================== */
@@ -244,12 +272,13 @@ const signupLimiter = rateLimit({
 });
 
 // Global API Rate Limiter - 100 requests per 15 minutes
+// Admin accounts are excluded from this limiter (see skipIfAdmin)
 const globalLimiter = rateLimit({
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_GLOBAL || 15) * 60 * 1000,
     max: parseInt(process.env.RATE_LIMIT_MAX_GLOBAL || 100),
     standardHeaders: true,
     legacyHeaders: false,
-    skip: skipWhitelisted,
+    skip: skipIfAdmin,
     store: getStore('rl:global:'),
     handler: async (req, res) => {
         if (req.pool) {
