@@ -1824,9 +1824,12 @@ app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct
       ]
     );
 
+    // Fetch the newly created product to return in the response
+    const [insertedProducts] = await pool.query('SELECT * FROM Products WHERE id = ?', [result.insertId]);
+
     res.json({
       success: true,
-      data: products[0]
+      data: insertedProducts[0]
     });
   } catch (error) {
     console.error('Create product error:', error);
