@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const multer = require('multer');
@@ -513,6 +514,57 @@ async function initDatabase() {
         INDEX idx_auto_unblock (auto_unblock)
       )
     `);
+
+    // Create price_update_logs table
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS price_update_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        admin_id INT NOT NULL,
+        categories JSON NOT NULL,
+        apply_to_all BOOLEAN DEFAULT FALSE,
+        category_count INT DEFAULT 0,
+        action ENUM('increase', 'decrease') NOT NULL,
+        mode ENUM('fixed', 'percentage') NOT NULL,
+        value DECIMAL(10, 2) NOT NULL,
+        total_price_before DECIMAL(15, 2) NOT NULL,
+        total_price_after DECIMAL(15, 2) NOT NULL,
+        affected_count INT NOT NULL,
+        preview_hash VARCHAR(255) NOT NULL,
+        rolled_back BOOLEAN DEFAULT FALSE,
+        rolled_back_at DATETIME NULL,
+        rollback_admin_id INT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_logs_admin (admin_id),
+        INDEX idx_logs_timestamp (timestamp),
+        FOREIGN KEY (admin_id) REFERENCES Users(id) ON DELETE CASCADE,
+        FOREIGN KEY (rollback_admin_id) REFERENCES Users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // Create price_update_items table
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS price_update_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        log_id INT NOT NULL,
+        product_id INT NOT NULL,
+        old_price DECIMAL(10, 2) NOT NULL,
+        new_price DECIMAL(10, 2) NOT NULL,
+        INDEX idx_items_log_id (log_id),
+        INDEX idx_items_product_id (product_id),
+        FOREIGN KEY (log_id) REFERENCES price_update_logs(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES Products(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Add Index to Products.category for performance
+    try {
+      await connection.query('CREATE INDEX idx_products_category ON Products(category)');
+      console.log('✅ Added idx_products_category index to Products table');
+    } catch (e) {
+      if (!e.message.includes('Duplicate key name')) {
+        console.log('ℹ️  idx_products_category index already exists or other error:', e.message);
+      }
+    }
 
     console.log('✅ Database tables initialized');
   } finally {
@@ -1772,7 +1824,6 @@ app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct
       ]
     );
 
-    const [products] = await pool.query('SELECT * FROM Products WHERE id = ?', [result.insertId]);
     res.json({
       success: true,
       data: products[0]
@@ -1783,6 +1834,332 @@ app.post('/api/products', adminOnly, upload.array('images', 10), validateProduct
       success: false,
       message: 'Server error: ' + error.message
     });
+  }
+});
+
+/**
+ * Bulk Price Update APIs
+ */
+
+/**
+ * POST /api/admin/products/bulk-price-update/preview
+ * Calculates the impact of a bulk price change without applying it.
+ */
+app.post('/api/admin/products/bulk-price-update/preview', adminOnly, async (req, res) => {
+  try {
+    const { action, mode, value, categories, applyToAll } = req.body;
+
+    // 1. Validation
+    if (!['increase', 'decrease'].includes(action)) return res.status(400).json({ success: false, message: 'Invalid action' });
+    if (!['fixed', 'percentage'].includes(mode)) return res.status(400).json({ success: false, message: 'Invalid mode' });
+    if (isNaN(value) || value <= 0) return res.status(400).json({ success: false, message: 'Invalid adjustment value' });
+    
+    // Safety thresholds
+    if (mode === 'percentage' && value > 1000) return res.status(400).json({ success: false, message: 'Percentage increase cannot exceed 1000%' });
+    if (mode === 'fixed' && value > 10000) return res.status(400).json({ success: false, message: 'Fixed adjustment cannot exceed 10,000' });
+
+    // 2. Build Query
+    let query = 'SELECT id, title, price, category FROM Products';
+    const params = [];
+    if (!applyToAll) {
+      if (!Array.isArray(categories) || categories.length === 0) return res.status(400).json({ success: false, message: 'No categories provided' });
+      query += ' WHERE category IN (?)';
+      params.push([categories]);
+    }
+
+    const [products] = await pool.query(query, params);
+
+    if (products.length === 0) {
+      return res.status(404).json({ success: false, message: 'No products found matching the criteria' });
+    }
+
+    // 3. Calculate Stats
+    let totalBefore = 0;
+    let totalAfter = 0;
+    const sampleSize = 10;
+    const sample = [];
+
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      const oldPrice = parseFloat(p.price);
+      let newPrice = oldPrice;
+
+      if (action === 'increase') {
+        if (mode === 'fixed') newPrice = oldPrice + parseFloat(value);
+        else newPrice = oldPrice * (1 + parseFloat(value) / 100);
+      } else {
+        if (mode === 'fixed') newPrice = Math.max(0, oldPrice - parseFloat(value));
+        else newPrice = Math.max(0, oldPrice * (1 - parseFloat(value) / 100));
+      }
+
+      newPrice = Math.round(newPrice * 100) / 100;
+      totalBefore += oldPrice;
+      totalAfter += newPrice;
+
+      if (i < sampleSize) {
+        sample.push({
+          id: p.id,
+          title: p.title,
+          oldPrice,
+          newPrice,
+          category: p.category
+        });
+      }
+    }
+
+    // 4. Generate Hash for the operation to prevent double-submit and drift
+    const previewHash = crypto.createHash('md5').update(JSON.stringify({ 
+      action, mode, value, categories, applyToAll, 
+      productCount: products.length, 
+      totalBefore: Math.round(totalBefore * 100) / 100 
+    })).digest('hex');
+
+    res.json({
+      success: true,
+      data: {
+        affectedCount: products.length,
+        totalPriceBefore: Math.round(totalBefore * 100) / 100,
+        totalPriceAfter: Math.round(totalAfter * 100) / 100,
+        priceDifference: Math.round((totalAfter - totalBefore) * 100) / 100,
+        percentageChange: totalBefore === 0 ? 0 : Math.round(((totalAfter - totalBefore) / totalBefore) * 10000) / 100,
+        sample,
+        previewHash,
+        requiresConfirmation: products.length > 1000 || (mode === 'percentage' && value > 50)
+      }
+    });
+
+  } catch (error) {
+    console.error('Bulk price update preview error:', error);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+/**
+ * POST /api/admin/products/bulk-price-update
+ * Applies a bulk price change within a transaction.
+ */
+app.post('/api/admin/products/bulk-price-update', adminOnly, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { action, mode, value, categories, applyToAll, previewHash } = req.body;
+
+    // 1. Validation (Same as preview)
+    if (!['increase', 'decrease'].includes(action)) throw new Error('Invalid action');
+    if (!['fixed', 'percentage'].includes(mode)) throw new Error('Invalid mode');
+    if (isNaN(value) || value <= 0) throw new Error('Invalid adjustment value');
+    if (!previewHash) throw new Error('Preview hash is required');
+
+    // Rate Limiting (Simple check against last minute logs)
+    const [recentUpdates] = await connection.query(
+      'SELECT COUNT(*) as count FROM price_update_logs WHERE admin_id = ? AND timestamp > (NOW() - INTERVAL 1 MINUTE)',
+      [req.user.id]
+    );
+    if (recentUpdates[0].count >= 5) {
+      connection.release();
+      return res.status(429).json({ success: false, message: 'Rate limit exceeded. Max 5 bulk updates per minute.' });
+    }
+
+    await connection.beginTransaction();
+
+    // 2. Fetch products for logging and comparison (SELECT ... FOR UPDATE to prevent race conditions)
+    let selectQuery = 'SELECT id, price FROM Products';
+    const selectParams = [];
+    if (!applyToAll) {
+      if (!Array.isArray(categories) || categories.length === 0) throw new Error('No categories provided');
+      selectQuery += ' WHERE category IN (?)';
+      selectParams.push([categories]);
+    }
+    selectQuery += ' FOR UPDATE';
+
+    const [products] = await connection.query(selectQuery, selectParams);
+
+    if (products.length === 0) {
+      throw new Error('No products found matching the criteria');
+    }
+
+    // Verify against previewHash (simplified verification: totalBefore)
+    let totalBefore = 0;
+    products.forEach(p => totalBefore += parseFloat(p.price));
+    totalBefore = Math.round(totalBefore * 100) / 100;
+
+    const currentHash = crypto.createHash('md5').update(JSON.stringify({ 
+      action, mode, value, categories, applyToAll, 
+      productCount: products.length, 
+      totalBefore 
+    })).digest('hex');
+
+    if (currentHash !== previewHash) {
+      throw new Error('Price data has changed since preview. Please refresh and try again.');
+    }
+    
+    // 3. Batch Update Prices
+    let updateSql = 'UPDATE Products SET price = ';
+    if (action === 'increase') {
+      if (mode === 'fixed') updateSql += `ROUND(price + ?, 2)`;
+      else updateSql += `ROUND(price * (1 + ? / 100), 2)`;
+    } else {
+      if (mode === 'fixed') updateSql += `GREATEST(0, ROUND(price - ?, 2))`;
+      else updateSql += `GREATEST(0, ROUND(price * (1 - ? / 100), 2))`;
+    }
+
+    if (!applyToAll) {
+      updateSql += ' WHERE category IN (?)';
+    } else {
+      updateSql += ' WHERE 1=1';
+    }
+
+    const updateParams = [parseFloat(value)];
+    if (!applyToAll) updateParams.push([categories]);
+
+    const [updateResult] = await connection.query(updateSql, updateParams);
+    const affectedRows = updateResult.affectedRows;
+
+    // 4. Fetch new prices for items log
+    let fetchUpdatedQuery = 'SELECT id, price FROM Products';
+    const fetchUpdatedParams = [];
+    if (!applyToAll) {
+      fetchUpdatedQuery += ' WHERE category IN (?)';
+      fetchUpdatedParams.push([categories]);
+    }
+    const [updatedProducts] = await connection.query(fetchUpdatedQuery, fetchUpdatedParams);
+    
+    let totalAfter = 0;
+    updatedProducts.forEach(p => totalAfter += parseFloat(p.price));
+    totalAfter = Math.round(totalAfter * 100) / 100;
+
+    // 5. Create Log Header
+    const [logResult] = await connection.query(`
+      INSERT INTO price_update_logs 
+      (admin_id, categories, apply_to_all, category_count, action, mode, value, total_price_before, total_price_after, affected_count, preview_hash) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        JSON.stringify(categories || []),
+        applyToAll ? 1 : 0,
+        applyToAll ? 0 : (categories ? categories.length : 0),
+        action,
+        mode,
+        parseFloat(value),
+        totalBefore,
+        totalAfter,
+        affectedRows,
+        previewHash
+      ]
+    );
+
+    const logId = logResult.insertId;
+
+    // 6. Batch Insert Log Items in Chunks
+    const items = [];
+    for (const p of products) {
+      const updatedP = updatedProducts.find(up => up.id === p.id);
+      if (updatedP) {
+        items.push([logId, p.id, p.price, updatedP.price]);
+      }
+    }
+
+    const chunkSize = 500;
+    for (let i = 0; i < items.length; i += chunkSize) {
+      const chunk = items.slice(i, i + chunkSize);
+      await connection.query(
+        'INSERT INTO price_update_items (log_id, product_id, old_price, new_price) VALUES ?',
+        [chunk]
+      );
+    }
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: `Successfully updated prices for ${affectedRows} products.`,
+      logId
+    });
+
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+      connection.release();
+    }
+    console.error('Bulk price update error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/products/bulk-price-update/:logId/rollback
+ * Reverts a specific price update log.
+ */
+app.post('/api/admin/products/bulk-price-update/:logId/rollback', adminOnly, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { logId } = req.params;
+
+    // 1. Fetch Log and verify status
+    const [logs] = await connection.query('SELECT * FROM price_update_logs WHERE id = ? FOR UPDATE', [logId]);
+    if (logs.length === 0) {
+      connection.release();
+      return res.status(404).json({ success: false, message: 'Update log not found' });
+    }
+    
+    const log = logs[0];
+    if (log.rolled_back) {
+      connection.release();
+      return res.status(400).json({ success: false, message: 'This operation has already been rolled back' });
+    }
+
+    await connection.beginTransaction();
+
+    // 2. Fetch all items (old prices)
+    const [items] = await connection.query('SELECT product_id, old_price FROM price_update_items WHERE log_id = ?', [logId]);
+
+    // 3. Restore prices in chunks using CASE statement
+    if (items.length > 0) {
+      const chunkSize = 100;
+      for (let i = 0; i < items.length; i += chunkSize) {
+        const chunk = items.slice(i, i + chunkSize);
+        let ids = [];
+        let rollbackSql = 'UPDATE Products SET price = CASE id ';
+        chunk.forEach(item => {
+          rollbackSql += `WHEN ${item.product_id} THEN ${item.old_price} `;
+          ids.push(item.product_id);
+        });
+        rollbackSql += `END WHERE id IN (?)`;
+        await connection.query(rollbackSql, [ids]);
+      }
+    }
+
+    // 4. Update Log status
+    await connection.query(
+      'UPDATE price_update_logs SET rolled_back = TRUE, rolled_back_at = NOW(), rollback_admin_id = ? WHERE id = ?',
+      [req.user.id, logId]
+    );
+
+    // 5. Log Security Event
+    await logSecurityEvent(pool, {
+      ip: req.ip,
+      event_type: 'ip_blocked', // Using existing categories for simplicity or just general log
+      endpoint: req.path,
+      user_id: req.user.id,
+      success: true,
+      metadata: { action: 'bulk_price_rollback', logId, affectedCount: items.length }
+    });
+
+    await connection.commit();
+    connection.release();
+
+    res.json({
+      success: true,
+      message: `Rollback successful for ${items.length} products.`
+    });
+
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+      connection.release();
+    }
+    console.error('Rollback error:', error);
+    res.status(500).json({ success: false, message: 'Rollback failed: ' + error.message });
   }
 });
 
