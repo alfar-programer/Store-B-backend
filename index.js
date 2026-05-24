@@ -10,7 +10,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const cron = require('node-cron');
-const { sendVerificationEmail, generateOTP, isConfigured, EMAIL_VERIFICATION_ENABLED } = require('./emailService');
+const { sendVerificationEmail, sendOrderNotificationEmail, generateOTP, isConfigured, EMAIL_VERIFICATION_ENABLED } = require('./emailService');
 const { verifyGoogleToken, validateGoogleConfig } = require('./googleOAuth');
 
 dotenv.config();
@@ -2288,10 +2288,28 @@ app.post('/api/orders', authOnly, validateOrder, async (req, res) => {
     await connection.commit();
 
     const [orders] = await connection.query('SELECT * FROM Orders WHERE id = ?', [result.insertId]);
+    const createdOrder = orders[0];
+
     res.json({
       success: true,
-      data: orders[0],
+      data: createdOrder,
       message: 'Order placed successfully and stock updated'
+    });
+
+    // ── Send admin notification email (non-blocking) ────────────────────────
+    // Runs after the response is sent so it never delays the customer
+    setImmediate(async () => {
+      try {
+        // Fetch customer details (name, email, phone) for the email
+        const [userRows] = await pool.query(
+          'SELECT id, name, email, phone FROM Users WHERE id = ?',
+          [UserId]
+        );
+        const customerUser = userRows[0] || { name: customerName, email: '—', phone: '—' };
+        await sendOrderNotificationEmail(createdOrder, customerUser);
+      } catch (notifErr) {
+        console.error('❌ Order notification email failed (non-blocking):', notifErr.message);
+      }
     });
   } catch (error) {
     await connection.rollback();

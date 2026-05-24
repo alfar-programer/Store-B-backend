@@ -162,8 +162,206 @@ function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+/**
+ * Send order notification email to admin when a new order is placed
+ * @param {Object} order - The newly created order object from DB
+ * @param {Object} user  - The customer user record (with name, email, phone)
+ * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
+ */
+async function sendOrderNotificationEmail(order, user) {
+  const ADMIN_EMAIL = process.env.ADMIN_NOTIFICATION_EMAIL;
+
+  if (!ADMIN_EMAIL) {
+    console.warn('⚠️  ADMIN_NOTIFICATION_EMAIL is not set. Skipping order notification.');
+    return { success: false, error: 'ADMIN_NOTIFICATION_EMAIL not configured' };
+  }
+
+  if (!isConfigured()) {
+    console.error('❌ Cannot send order notification: email service not configured.');
+    return { success: false, error: 'Email service not configured' };
+  }
+
+  // Parse items from the order (stored as JSON string)
+  let items = [];
+  try {
+    items = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []);
+  } catch {
+    items = [];
+  }
+
+  // Parse shipping address
+  let shippingAddress = null;
+  try {
+    shippingAddress = typeof order.shippingAddress === 'string'
+      ? JSON.parse(order.shippingAddress)
+      : order.shippingAddress;
+  } catch {
+    shippingAddress = null;
+  }
+
+  // Format the order date
+  const orderDate = order.createdAt
+    ? new Date(order.createdAt).toLocaleString('en-US', {
+        year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        timeZoneName: 'short'
+      })
+    : new Date().toLocaleString('en-US', {
+        year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        timeZoneName: 'short'
+      });
+
+  // Build items rows HTML
+  const itemsRows = items.map(item => {
+    const name  = item.title || item.name || `Product #${item.id || item.productId}`;
+    const qty   = item.quantity || 1;
+    const price = parseFloat(item.price || 0).toFixed(2);
+    const subtotal = (qty * parseFloat(item.price || 0)).toFixed(2);
+    return `
+      <tr>
+        <td style="padding:10px 12px;border-bottom:1px solid #e8e8e8;color:#333;">${name}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e8e8e8;text-align:center;color:#555;">${qty}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e8e8e8;text-align:right;color:#555;">$${price}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e8e8e8;text-align:right;font-weight:600;color:#333;">$${subtotal}</td>
+      </tr>`;
+  }).join('');
+
+  // Build shipping address block
+  const addressHtml = shippingAddress
+    ? `
+      <div style="margin-top:20px;background:#f0f7ff;border-left:4px solid #4f86f7;padding:15px 20px;border-radius:0 8px 8px 0;">
+        <p style="margin:0 0 6px;font-weight:700;color:#2563eb;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;">📦 Delivery Address</p>
+        <p style="margin:0;color:#374151;line-height:1.6;">
+          ${[
+            shippingAddress.fullName || shippingAddress.name || user.name,
+            shippingAddress.street || shippingAddress.address,
+            shippingAddress.city,
+            shippingAddress.state,
+            shippingAddress.postalCode || shippingAddress.zip,
+            shippingAddress.country
+          ].filter(Boolean).join(', ')}
+        </p>
+      </div>`
+    : '<p style="color:#9ca3af;font-style:italic;margin-top:16px;">No delivery address provided.</p>';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>New Order Notification</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:30px 0;">
+    <tr><td align="center">
+      <table width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 60%,#06b6d4 100%);padding:36px 40px;text-align:center;">
+            <p style="margin:0 0 6px;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:1px;text-transform:uppercase;">WarmTouch Store</p>
+            <h1 style="margin:0;font-size:26px;color:#ffffff;font-weight:700;">🛍️ New Order Received</h1>
+            <p style="margin:10px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Order #${order.id} &nbsp;·&nbsp; ${orderDate}</p>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr><td style="padding:32px 40px;">
+
+          <!-- Customer Info -->
+          <h2 style="margin:0 0 16px;font-size:16px;color:#111827;border-bottom:2px solid #e5e7eb;padding-bottom:10px;">👤 Customer Details</h2>
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td style="padding:6px 0;color:#6b7280;font-size:14px;width:120px;">Name</td>
+              <td style="padding:6px 0;color:#111827;font-weight:600;font-size:14px;">${user.name || order.customerName || '—'}</td>
+            </tr>
+            <tr>
+              <td style="padding:6px 0;color:#6b7280;font-size:14px;">Email</td>
+              <td style="padding:6px 0;color:#2563eb;font-size:14px;">${user.email || '—'}</td>
+            </tr>
+            <tr>
+              <td style="padding:6px 0;color:#6b7280;font-size:14px;">Phone</td>
+              <td style="padding:6px 0;color:#111827;font-size:14px;">${user.phone || '—'}</td>
+            </tr>
+          </table>
+
+          <!-- Items Table -->
+          <h2 style="margin:28px 0 16px;font-size:16px;color:#111827;border-bottom:2px solid #e5e7eb;padding-bottom:10px;">🛒 Ordered Items</h2>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border-radius:8px;overflow:hidden;border:1px solid #e5e7eb;">
+            <thead>
+              <tr style="background:#1e3a8a;">
+                <th style="padding:11px 12px;text-align:left;color:#fff;font-size:13px;font-weight:600;">Product</th>
+                <th style="padding:11px 12px;text-align:center;color:#fff;font-size:13px;font-weight:600;">Qty</th>
+                <th style="padding:11px 12px;text-align:right;color:#fff;font-size:13px;font-weight:600;">Unit Price</th>
+                <th style="padding:11px 12px;text-align:right;color:#fff;font-size:13px;font-weight:600;">Subtotal</th>
+              </tr>
+            </thead>
+            <tbody>${itemsRows}</tbody>
+          </table>
+
+          <!-- Total -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:0;">
+            <tr>
+              <td style="padding:14px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-top:none;border-radius:0 0 8px 8px;">
+                <span style="float:left;font-weight:700;color:#166534;font-size:15px;">💰 Order Total</span>
+                <span style="float:right;font-weight:800;color:#166534;font-size:18px;">$${parseFloat(order.total || 0).toFixed(2)}</span>
+                <div style="clear:both;"></div>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Shipping Address -->
+          ${addressHtml}
+
+        </td></tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f9fafb;padding:20px 40px;text-align:center;border-top:1px solid #e5e7eb;">
+            <p style="margin:0;color:#9ca3af;font-size:12px;">This is an automated notification from WarmTouch Store admin system.</p>
+            <p style="margin:4px 0 0;color:#9ca3af;font-size:12px;">Please do not reply to this email.</p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  try {
+    console.log(`📧 Sending order notification email for Order #${order.id} to: ${ADMIN_EMAIL}`);
+
+    const result = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: ADMIN_EMAIL,
+      subject: `🛍️ New Order #${order.id} — ${order.customerName || user.name} ($${parseFloat(order.total || 0).toFixed(2)})`,
+      html,
+    });
+
+    if (result.error) {
+      console.error('❌ Resend API error (order notification):', result.error);
+      return { success: false, error: result.error.message || JSON.stringify(result.error) };
+    }
+
+    const messageId = result.data?.id || result.id;
+    console.log(`✅ Order notification email sent. Message ID: ${messageId}`);
+    return { success: true, messageId };
+
+  } catch (err) {
+    console.error('❌ Failed to send order notification email:', {
+      error: err.message,
+      orderId: order.id,
+      stack: err.stack
+    });
+    return { success: false, error: err.message };
+  }
+}
+
 module.exports = {
   sendVerificationEmail,
+  sendOrderNotificationEmail,
   generateOTP,
   isConfigured,
   EMAIL_VERIFICATION_ENABLED,
